@@ -327,11 +327,22 @@ class Gateway:
             if v: rows=[r for r in rows if (r.get('outcome')==v if k=='status' else v.lower() in str(r.get('model','')).lower() if k=='model' else r.get(k)==v)]
         for k,before in [('from',False),('to',True)]:
             if q.get(k): rows=[r for r in rows if (r['started_at']<=q[k] if before else r['started_at']>=q[k])]
+        live={k['id']:k for k in self.store.keys}; seen={}
+        for r in rows:
+            if r.get('api_key_id') and r['api_key_id'] not in seen: seen[r['api_key_id']]=r
+        options=[]
+        for kid,row in seen.items():
+            k=live.get(kid) or {}; prefix=row.get('api_key_prefix') or k.get('prefix') or ''
+            name=row.get('api_key_name') or k.get('name') or ('Revoked key '+kid[:8])
+            state='revoked' if not k else 'expired' if k.get('expires_at') and k['expires_at']<=now() else 'active' if k.get('enabled') else 'disabled'
+            options.append({'id':kid,'name':name,'prefix':prefix,'state':state,'calls':sum(1 for r in rows if r.get('api_key_id')==kid),'label':name+(' · '+prefix+'…' if prefix else ' · '+kid[:8])})
+        options.sort(key=lambda o:(-o['calls'],o['name']))
+        if q.get('key'): rows=[r for r in rows if r.get('api_key_id')==q['key']]
         credits=[r['credit'] for r in rows if number(r.get('credit'))]
-        return {'data':rows[(page-1)*limit:page*limit],'total':len(rows),'page':page,'limit':limit,'summary':{'requests':len(rows),'known_credit':sum(credits),'credit_known':len(credits),'credit_unknown':len(rows)-len(credits),'request_bytes':sum(r.get('request_bytes',0) for r in rows)},'retention_days':30,'max_entries':10000,'storage_error':None}
+        return {'data':rows[(page-1)*limit:page*limit],'total':len(rows),'page':page,'limit':limit,'key_options':options,'summary':{'requests':len(rows),'known_credit':sum(credits),'credit_known':len(credits),'credit_unknown':len(rows)-len(credits),'request_bytes':sum(r.get('request_bytes',0) for r in rows)},'retention_days':30,'max_entries':10000,'storage_error':None}
     async def generate(self,req,principal):
         start=time.monotonic(); raw=await req.read()
-        row={'id':uid('req_'),'started_at':now(),'endpoint':req.path,'request_ip':request_ip(req),'api_key_id':principal['id'],'request_bytes':len(raw),'status_code':200,'outcome':'pending','credit':None,'credit_source':None,'first_token_ms':None,'first_text_ms':None,'reasoning_ms':None,'reasoning_timing_source':None,'latency_source':None,'input_tokens':None,'output_tokens':None,'reasoning_tokens':None}
+        row={'id':uid('req_'),'started_at':now(),'endpoint':req.path,'request_ip':request_ip(req),'api_key_id':principal['id'],'api_key_name':principal.get('name'),'api_key_prefix':principal.get('prefix'),'request_bytes':len(raw),'status_code':200,'outcome':'pending','credit':None,'credit_source':None,'first_token_ms':None,'first_text_ms':None,'reasoning_ms':None,'reasoning_timing_source':None,'latency_source':None,'input_tokens':None,'output_tokens':None,'reasoning_tokens':None}
         stream_response=None; upstream=None; selected=None; busy_acquired=False; writer=None; reasoning_start=None; reasoning_end=None; last_reason=None
         try:
             try: body=json.loads(raw)
