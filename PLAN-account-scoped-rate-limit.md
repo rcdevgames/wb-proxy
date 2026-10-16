@@ -94,11 +94,37 @@ Real upstream, one synthetic account-scoped restriction injected into a **copy**
 `intl_692c2e7a3` and `intl_eef0f9271` — the restricted `steezclubka` (`intl_4b44b6d96`) served none
 of them. The same run before the change would have answered `429` locally after the first request.
 
+### A real upstream 429, reproduced live
+
+30 chats in three cadences against the running service (`tight` 10 × 1.0 s, `normal` 10 × 2.5 s,
+`burst` 10 × 0.4 s): **29 × `200`, 1 × `429`**, and the single failure is the behaviour under test:
+
+```
+08:47:29.734  429 failed  acc=intl_eef0f9271  up=14003  dur=184ms   err=risk_rate_limited
+08:47:30.365  200 completed  acc=intl_1b479386c  up=None  dur=1314ms
+```
+
+The upstream refused `intl_eef0f9271` with a genuine `14003`, so that one request failed; the next
+request 0.6 s later was served by another account and succeeded. `data/risk-state.json` afterwards
+holds exactly one entry — `kind=rate_limited, scope=account, account_id=intl_eef0f9271, count=1` —
+instead of the region-wide entry that used to follow. No call-log row from the run has a null
+`account_id` with a sub-millisecond duration, i.e. the local gate never answered a request that a
+healthy account could have served.
+
+Follow-up while that entry was still active (27 s left): 6 chats → **6 × `200`**, the restricted
+account serving **0 of 6**. Before the change the remaining 27 s of the cooldown would have refused
+every one of them in under a millisecond.
+
+The 30 rows also show the rotation across the pool (`intl_4b44b6d96`, `intl_692c2e7a3`,
+`intl_eef0f9271`, `intl_0991d6893`, `intl_1b479386c`, in that order, repeating) and `upstream_code`
+filled only on the failure, which is the expected log shape.
+
 ## Pending / not verified
 
-- The 60 s cooldown per account is unchanged; only its reach is. A real upstream `429` under load
-  was not reproduced on demand, so the account-scoped entry is verified against the stub and a
-  synthetic entry, not against a live upstream `429`.
+- The 60 s cooldown per account is unchanged; only its reach is. A real upstream `429` was
+  reproduced live (see above) and the one request that hit it failed, as designed — the gateway does
+  not retry a turn, so the first request to meet a `14003` is lost and the rest of the cooldown is
+  absorbed by the pool.
 - Escalation is still `delay * 2^(count-1)` capped at 15 min per account. With five accounts a
   sustained `429` on all of them can now produce five entries instead of one; no aggregate cap is
   enforced.
