@@ -106,7 +106,7 @@ class Gateway:
                     for record_value in self.store.records.values():
                         for secret in record_value.get('auth',{}).values():
                             if isinstance(secret,str) and len(secret)>16:message=message.replace(secret,'[REDACTED]')
-                    raise Fault(response.status if 400<=response.status<500 else 502,message[:500],'upstream_'+str(details.get('code','error')))
+                    fault=Fault(response.status if 400<=response.status<500 else 502,message[:500],'upstream_'+str(details.get('code','error'))); fault.upstream_code=str(details.get('code','error')); raise fault
                 return data
             finally: response.release()
         except asyncio.TimeoutError: raise Fault(504,'Upstream timeout','upstream_timeout')
@@ -153,8 +153,13 @@ class Gateway:
         for r in rows:
             try: out.append((r,visible(await self.catalog(r))))
             except Fault as e:
-                if e.risk: raise
-                errors.append(safe_error(e))
+                # An account-scoped restriction hides that one account; the region keeps serving.
+                if getattr(e,'risk',None) and e.risk.get('scope')!='account': raise
+                errors.append({'account_id':r['id'],'error':safe_error(e),'risk':getattr(e,'risk',None)})
+        restricted=[x for x in errors if x.get('risk')]
+        if not out and restricted:
+            e=max(restricted,key=lambda x:x['risk'].get('retry_at',0))['risk']
+            raise Fault(e.get('status',429),e.get('action','Upstream restriction active'),'risk_'+e['kind'],e)
         require(out,'No live model catalogs available',503,'catalog_unavailable'); return out,errors
     async def model_list(self,scope,region=None):
         rows,errors=await self.catalogs_for(scope,internal_region(region)); by={}
@@ -337,7 +342,7 @@ class Gateway:
             if sep and prefix in ('cn','gl','intl'):
                 resolved=internal_region(prefix); require(not region or region==resolved,'Conflicting region'); region=resolved; chat['model']=mid
             elif sep: raise Fault(400,'Use a cn/ or gl/ model ID','invalid_model_region')
-            catalogs,_=await self.catalogs_for(principal['scope'],region,req.headers.get('X-WB-Account')); candidates=[]; exists=False
+            catalogs,errors=await self.catalogs_for(principal['scope'],region,req.headers.get('X-WB-Account')); candidates=[]; blocked=[e['risk'] for e in errors if e.get('risk')]; exists=False
             matching_regions={r['region'] for r,models in catalogs if any(m['id']==chat['model'] for m in models)}
             require(region or len(matching_regions)<=1,'Model exists in both regions; select cn/'+chat['model']+' or gl/'+chat['model'],400,'ambiguous_model_region')
             for r,models in catalogs:
@@ -348,9 +353,16 @@ class Gateway:
                 if chat.get('reasoning_effort') and c['efforts'] and chat['reasoning_effort'] not in c['efforts']: continue
                 if chat.get('tools') and not c['supports_tools']: continue
                 if self.busy.get(r['id'],0)>=8 or r['id'] in self.switching or r.get('needsAccountSync'): continue
+                # A restricted account is skipped, not fatal: another account serves the request
+                # instead of the call failing while healthy accounts idle.
+                restriction=self.risk.block(r['region'],r['id'],'/v2/chat/completions')
+                if restriction: blocked.append(restriction); continue
                 candidates.append((r,m))
+            if not candidates and blocked:
+                restriction=max(blocked,key=lambda e:e.get('retry_at',0))
+                raise Fault(restriction.get('status',429),restriction.get('action','Upstream restriction active'),'risk_'+restriction['kind'],restriction)
             require(candidates,'Unsupported model parameters or all matching accounts busy' if exists else 'Model not available',400 if exists else 404,'unsupported_model_parameter' if exists else 'model_not_found')
-            candidates.sort(key=lambda rm:(self.busy.get(rm[0]['id'],0),self.last_picked.get(rm[0]['id'],0),rm[0]['id'])); selected,m=candidates[0]; self.risk.check(selected['region'],selected['id'],'/v2/chat/completions'); self.busy[selected['id']]=self.busy.get(selected['id'],0)+1; self.last_picked[selected['id']]=time.monotonic(); busy_acquired=True
+            candidates.sort(key=lambda rm:(self.busy.get(rm[0]['id'],0),self.last_picked.get(rm[0]['id'],0),rm[0]['id'])); selected,m=candidates[0]; self.busy[selected['id']]=self.busy.get(selected['id'],0)+1; self.last_picked[selected['id']]=time.monotonic(); busy_acquired=True
             selected=await self.refresh(selected); response_model=public_model(selected['region'],chat['model']); row.update(region=selected['region'],account_id=selected['id'],model=response_model)
             cap=controls(m)['max_output_tokens']
             if chat.get('max_tokens') and number(cap) and cap>0:
@@ -405,7 +417,8 @@ class Gateway:
             row.update(outcome='failed',status_code=getattr(e,'status',502),error_code=getattr(e,'code','upstream_error'))
             row['error_message']=safe_error(e)['message'][:500]
             risk=getattr(e,'risk',None) or {}
-            if risk.get('upstream_code') is not None: row['upstream_code']=risk['upstream_code']
+            code=risk.get('upstream_code') or getattr(e,'upstream_code',None)
+            if code is not None: row['upstream_code']=str(code)
 
             if stream_response is not None:
                 err=error_body(e,row['id'])

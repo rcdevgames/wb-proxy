@@ -29,6 +29,14 @@ Only the header family differs between the three runs:
 client"}` — and it fires only when the first message is not a system prompt, which `prepare()` in
 `wb_gateway/protocol.py` already covers for intl. Same error code, different message from #4892.
 
+### Correction (2026-10-16, after the account-scoped rate-limit work)
+
+The A/B above used a single account. Probing every intl account shows the header family **is** gated,
+per account: `neoaimez` answers `400 {"code":11128,"msg":"conversation id missing"}` to the old
+headers and `200` to the new ones, while `steezclubka`, `yeetvibes`, `deaddelulurealm` and `vibegoofy`
+answer `200` to both. So this change repairs an account that failed 100 % of its calls, and the
+per-account check is the rule — never conclude anything about the gate from one account.
+
 Operator decision: port the header pattern anyway, as hardening and for conversation continuity,
 because the gateway used to send a random conversation id on every request.
 

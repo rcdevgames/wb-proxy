@@ -57,6 +57,8 @@ class Risk:
         for e in store.risks:
             if e.get('kind')=='channel_not_allowed' and e.get('scope')=='region' and str(e.get('upstream_code'))=='11128':
                 e.update(scope='request',manual=False,retry_at=0,diagnostic_only=True,scope_corrected_at=now());changed=True
+            if e.get('kind')=='rate_limited' and e.get('scope')=='region' and e.get('account_id'):
+                e.update(scope='account',scope_corrected_at=now());changed=True
         if changed:self.save()
     def save(self): atomic(self.store.root/'risk-state.json',{'version':1,'entries':self.store.risks})
     def active(self,e): return not e.get('resolved_at') and (e.get('manual') or e.get('retry_at',0)>stamp())
@@ -69,9 +71,14 @@ class Risk:
         if e['scope']=='account': return not e.get('account_id') or e['account_id']==account
         if e['scope']=='operation': return e.get('path')==path
         return True
-    def check(self,region,account,path):
+    def block(self,region,account,path):
+        hit=None
         for e in self.store.risks:
-            if self.active(e) and self.matches(e,region,account,path): raise Fault(e.get('status',429),e.get('action','Upstream restriction active'),'risk_'+e['kind'],e)
+            if self.active(e) and self.matches(e,region,account,path) and (hit is None or e.get('retry_at',0)>hit.get('retry_at',0)): hit=e
+        return hit
+    def check(self,region,account,path):
+        e=self.block(region,account,path)
+        if e: raise Fault(e.get('status',429),e.get('action','Upstream restriction active'),'risk_'+e['kind'],e)
     def observe(self,status,body,region,account,path,headers=None):
         err=body.get('error') if isinstance(body.get('error'),dict) else body
         code=str(err.get('code','')); msg=str(err.get('message',err.get('msg','')))
@@ -81,7 +88,7 @@ class Risk:
         elif code in ('E0010458','E0010459'): kind='enterprise_quota'; scope='operation'; st=403
         elif re.search('captcha|turing|device.?token|device.?verification|risk.?control|verification.?code|human.?verification|验证码|人机验证|风控',code+' '+msg,re.I): kind='device_verification'; scope='global'; st=403
         elif status==401 or code=='401': kind='login_required'; st=401
-        elif status==429 or code=='429' or re.search('rate_limit|too_many_requests',code,re.I): kind='rate_limited'; scope='region'; manual=False; delay=60000; st=429
+        elif status==429 or code=='429' or re.search('rate_limit|too_many_requests',code,re.I): kind='rate_limited'; scope='account'; manual=False; delay=60000; st=429
         elif status==402 or re.search('insufficient_quota|quota_exceeded|insufficient_credits',code,re.I): kind='quota_exhausted'; st=402
         elif status==403 or code=='403': kind='permission_denied'; st=403
         elif status>=500: kind='upstream_unavailable'; scope='region'; manual=False; delay=5000; st=503
@@ -92,6 +99,7 @@ class Risk:
         except ValueError: pass
         e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+delay,'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now()}
         if kind=='channel_not_allowed':e['action']='Upstream rejected this request (11128: unapproved channel). The cause is not yet identified; no automatic replay, no account switching, and no region-wide block on this basis.'
+        if kind=='rate_limited':e['action']='Upstream is rate limiting this account; the region keeps serving from the other accounts during the cooldown.'
         if old: old.update(e)
         else: self.store.risks.append(e)
         self.save(); return Fault(st,e['action'],'risk_'+kind,e)
