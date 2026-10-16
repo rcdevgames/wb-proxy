@@ -1,4 +1,4 @@
-﻿import asyncio, codecs, copy, json, time, os
+﻿import asyncio, codecs, copy, json, time, os, uuid
 from .storage import require, Fault, uid
 
 def validate_chat(b):
@@ -45,6 +45,38 @@ def tool_arguments(arguments, name, schema=None, *, status=502, code='invalid_to
             checks={'string':isinstance(value,str),'object':isinstance(value,dict),'array':isinstance(value,list),'integer':type(value) is int,'number':type(value) in (int,float),'boolean':type(value) is bool,'null':value is None}
             require(any(checks.get(t,True) for t in types),'Tool '+str(name)+' argument '+key+' has an invalid type',status,code)
     return payload
+
+# The intl channel verifies that a call came from the official client and keys its
+# conversation on the X-Conversation-* header family, so mirror the IDE: one stable
+# RFC-4122 id per session, a fresh id per request and per message.
+CONVERSATION_NAMESPACE=uuid.uuid5(uuid.NAMESPACE_URL,'workbuddy-gateway/conversation')
+
+def message_key(message):
+    content=message.get('content') if isinstance(message,dict) else message
+    if isinstance(content,str): return content
+    if isinstance(content,list):
+        parts=[]
+        for part in content:
+            if isinstance(part,str): parts.append(part)
+            elif isinstance(part,dict) and isinstance(part.get('text'),str): parts.append(part['text'])
+            elif part is not None: parts.append(json.dumps(part,sort_keys=True,ensure_ascii=False))
+        return chr(10).join(parts)
+    return json.dumps(content,sort_keys=True,ensure_ascii=False) if content is not None else ''
+
+def conversation_key(chat,incoming=None):
+    # A retried turn, or another account taking it over, has to keep the id, so
+    # derive it from the session the caller already identifies itself with.
+    for value in (incoming,chat.get('session_id'),chat.get('prompt_cache_key'),chat.get('conversation_id')):
+        if isinstance(value,str) and value.strip(): return value.strip()
+    for message in chat.get('messages') or []:
+        if isinstance(message,dict) and message.get('role')=='user':
+            key=message_key(message)
+            if key.strip(): return key
+    return uid('session_')
+
+def conversation_headers(chat,incoming=None):
+    return {'X-Conversation-ID':str(uuid.uuid5(CONVERSATION_NAMESPACE,conversation_key(chat,incoming))),
+            'X-Conversation-Request-ID':str(uuid.uuid4()),'X-Conversation-Message-ID':str(uuid.uuid4())}
 
 def prepare(chat,region):
     b=copy.deepcopy(chat)

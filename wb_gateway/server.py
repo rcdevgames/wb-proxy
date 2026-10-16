@@ -6,7 +6,7 @@ from .responses_compat import tool_specs
 from .anthropic import anthropic_to_chat, AnthropicWriter, anthropic_error
 from .storage import Store, Fault, require, unpack, now, stamp, atomic, read, uid, safe_error
 from .models import Risk, visible, controls, quote, number
-from .protocol import validate_chat, prepare, responses_to_chat, chunks, heartbeat_chunks, Accumulator, ResponsesWriter, contract, read_bounded
+from .protocol import validate_chat, prepare, conversation_headers, responses_to_chat, chunks, heartbeat_chunks, Accumulator, ResponsesWriter, contract, read_bounded
 
 def network_proxy():
     mode=os.environ.get('WB_PROXY_MODE','auto')
@@ -357,7 +357,7 @@ class Gateway:
                 row['requested_max_tokens']=chat['max_tokens'];chat['max_tokens']=min(chat['max_tokens'],int(cap));row['effective_max_tokens']=chat['max_tokens']
             unavailable=tool_specs(body)[1] if response_api else []
             if unavailable:row['unavailable_server_tools']=unavailable
-            rid=row['id']; headers={'X-Model-ID':chat['model'],'X-Agent-Intent':'craft','X-Agent-Purpose':'conversation','x-codebuddy-request':'1','X-Private-Data':'true','X-Conversation-ID':req.headers.get('X-Conversation-ID',uid('conv_')),'X-Conversation-Request-ID':rid,'X-Conversation-Message-ID':rid}
+            rid=row['id']; headers={'X-Model-ID':chat['model'],'X-Agent-Intent':'craft','X-Agent-Purpose':'conversation','x-codebuddy-request':'1','X-Private-Data':'true',**conversation_headers(chat,req.headers.get('X-Conversation-ID'))}
             upstream=await self.call(selected['region'],'/v2/chat/completions',selected,'POST',prepare(chat,selected['region']),headers,stream=True)
             async def emit(event,data):
                 payload=('event: '+event+chr(10) if event else '')+'data: '+(data if isinstance(data,str) else json.dumps(data,ensure_ascii=False,separators=(',',':')))+chr(10)*2
