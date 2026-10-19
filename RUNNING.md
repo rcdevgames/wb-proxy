@@ -101,6 +101,15 @@ The limits live on the key record in `data/api-keys.json`, so they survive a res
 
 Limits are charged before the request body is read, so an over-budget key cannot consume bandwidth or an account slot.
 
+## Failover on rate limits
+
+A request that lands on a rate-limited (or transiently failing) account is replayed on the next
+account that serves the same model, before anything is written to the client — the caller does not
+wait out the cooldown. `WB_MAX_FAILOVER` caps the attempts (default 3, `0` disables); client-caused
+rejections are never replayed. Once streaming has started there is nothing to replay, so a failure
+at that point is reported on the open stream. The attempt list is kept on the call row and shown as
+**Failover** in the log detail.
+
 ## Copying a key
 
 Each key card shows only `sk-wb-…` (the prefix) so a screenshot of the console cannot leak a working

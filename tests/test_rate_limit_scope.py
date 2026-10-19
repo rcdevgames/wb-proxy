@@ -8,6 +8,7 @@ in the call log with its upstream code.
 Run: ./.venv/bin/python -m unittest discover -s tests -v
 """
 import json, sys, tempfile, unittest
+from unittest import mock
 from pathlib import Path
 
 from aiohttp import web, ClientSession
@@ -26,6 +27,7 @@ class Upstream:
     def __init__(self):
         self.calls=[]
         self.fail={}
+        self.die_midstream=set()
         self.app=web.Application()
         self.app.router.add_post(PATH,self.chat)
         self.app.router.add_get('/v3/config',self.config)
@@ -40,6 +42,12 @@ class Upstream:
         if rejected:
             status,body=rejected
             return web.json_response(body,status=status)
+        if request.headers.get('X-User-Id','') in self.die_midstream:
+            response=web.StreamResponse(status=200,headers={'Content-Type':'text/event-stream'})
+            await response.prepare(request)
+            await response.write(('data: '+json.dumps({'id':'stub-1','object':'chat.completion.chunk','choices':[{'index':0,'delta':{'content':'par'}}]})+'\n\n').encode())
+            request.transport.abort()
+            return response
         response=web.StreamResponse(status=200,headers={'Content-Type':'text/event-stream'})
         await response.prepare(request)
         for chunk in ({'id':'stub-1','object':'chat.completion.chunk','choices':[{'index':0,'delta':{'role':'assistant','content':'OK'}}]},
@@ -76,16 +84,39 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
     def entry(self,kind):
         return next((e for e in self.gateway.store.risks if e['kind']==kind),None)
 
-    async def test_a_restricted_account_is_skipped_not_fatal(self):
+    async def test_a_rate_limited_account_is_replaced_before_the_first_byte(self):
         self.rate_limit('a')
-        first,payload,_=await self.send()
-        self.assertEqual(first,429,payload)
-        self.assertEqual(self.upstream.calls[-1]['headers']['X-User-Id'],'uid-intl-a')
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertEqual([c['headers']['X-User-Id'] for c in self.upstream.calls],['uid-intl-a','uid-intl-b'])
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
         served=len(self.upstream.calls)
         second,payload,_=await self.send()
         self.assertEqual(second,200,payload)
         self.assertEqual(len(self.upstream.calls),served+1)
         self.assertEqual(self.upstream.calls[-1]['headers']['X-User-Id'],'uid-intl-b')
+
+    async def test_a_stream_that_already_started_is_never_replayed(self):
+        self.upstream.die_midstream.add('uid-intl-a')
+        body={'model':'gl/'+MODEL,'messages':[{'role':'user','content':'hello'}],'stream':True,'max_tokens':16}
+        async with self.session.post(self.base+'/v1/chat/completions',json=body,headers={'Authorization':'Bearer '+self.key}) as response:
+            self.assertEqual(response.status,200)
+            text=await response.text()
+        self.assertIn('error',text)
+        self.assertEqual(len(self.upstream.calls),1,self.upstream.calls)
+
+    async def test_a_client_error_is_not_replayed_on_another_account(self):
+        for suffix in ('a','b'): self.upstream.fail['uid-intl-'+suffix]=(400,{'code':11128,'msg':'conversation id missing'})
+        status,payload,_=await self.send()
+        self.assertEqual(status,400,payload)
+        self.assertEqual(len(self.upstream.calls),1,self.upstream.calls)
+
+    async def test_failover_stops_at_the_configured_cap(self):
+        self.rate_limit('a','b')
+        with mock.patch('wb_gateway.server.MAX_FAILOVER',1):
+            status,payload,_=await self.send()
+        self.assertEqual(status,429,payload)
+        self.assertEqual(len(self.upstream.calls),1,self.upstream.calls)
 
     async def test_the_restriction_belongs_to_the_account_not_the_region(self):
         self.rate_limit('a')

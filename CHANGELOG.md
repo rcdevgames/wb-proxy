@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-19 — fail over to another account before the first byte
+
+- `generate()` no longer returns a 429 when the account it picked is rate limited. It walks the
+  candidate list (least-busy / least-recently-picked first), skips accounts that are in a cooldown,
+  and replays the request on the next account that serves the same model — inside the same request,
+  so the caller never waits out the cooldown.
+- Only failures another account can plausibly absorb are replayed: `risk_rate_limited`,
+  `risk_upstream_unavailable`, `upstream_connection_error`, `upstream_timeout`, and any 429/5xx.
+  A client-caused rejection (unknown model, bad parameter, 11128, 4xx) is returned immediately
+  instead of burning healthy accounts.
+- Bounded by `WB_MAX_FAILOVER` (default 3, 0 disables). Each attempt is logged in the call row as
+  `failover: [{account_id, status, code, at_ms}]`, and the log detail dialog shows a **Failover** line.
+- Once the response has started streaming there is nothing to replay: a mid-stream failure is still
+  reported in-band as an error event on the open stream, never retried.
+- Tests: `test_a_rate_limited_account_is_replaced_before_the_first_byte`,
+  `test_a_stream_that_already_started_is_never_replayed`,
+  `test_a_client_error_is_not_replayed_on_another_account`,
+  `test_failover_stops_at_the_configured_cap` — 52 tests pass.
+
 ## 2026-10-19 — keys can be copied again, without unmasking the list
 
 - `data/api-keys.json` now keeps each key's secret as AES-GCM ciphertext (`secret_enc`, sealed with

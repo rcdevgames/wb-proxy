@@ -42,3 +42,4 @@ analysis/
 artifacts/
 *.log
 *.jsonl
+exports/

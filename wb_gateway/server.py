@@ -9,6 +9,17 @@ from .models import Risk, visible, controls, quote, number
 from .limits import KeyLimits, model_allowed, model_patterns
 from .protocol import validate_chat, prepare, conversation_headers, responses_to_chat, chunks, heartbeat_chunks, Accumulator, ResponsesWriter, contract, read_bounded
 
+def _max_failover():
+    try: return max(0,min(10,int(os.environ.get('WB_MAX_FAILOVER','3'))))
+    except ValueError: return 3
+MAX_FAILOVER=_max_failover()
+# A failure that another account can plausibly absorb. Anything the client caused (bad model,
+# bad parameters, revoked key) is not in here: replaying it would only burn healthy accounts.
+FAILOVER_CODES={'risk_rate_limited','risk_upstream_unavailable','upstream_connection_error','upstream_timeout'}
+def failover_allowed(e):
+    if str(getattr(e,'code','')) in FAILOVER_CODES: return True
+    status=getattr(e,'status',0)
+    return status==429 or (isinstance(status,int) and status>=500)
 def network_proxy():
     mode=os.environ.get('WB_PROXY_MODE','auto')
     if mode=='direct': return None,'direct'
@@ -395,15 +406,33 @@ class Gateway:
                 restriction=max(blocked,key=lambda e:e.get('retry_at',0))
                 raise Fault(restriction.get('status',429),restriction.get('action','Upstream restriction active'),'risk_'+restriction['kind'],restriction)
             require(candidates,'Unsupported model parameters or all matching accounts busy' if exists else 'Model not available',400 if exists else 404,'unsupported_model_parameter' if exists else 'model_not_found')
-            candidates.sort(key=lambda rm:(self.busy.get(rm[0]['id'],0),self.last_picked.get(rm[0]['id'],0),rm[0]['id'])); selected,m=candidates[0]; self.busy[selected['id']]=self.busy.get(selected['id'],0)+1; self.last_picked[selected['id']]=time.monotonic(); busy_acquired=True
-            selected=await self.refresh(selected); response_model=public_model(selected['region'],chat['model']); row.update(region=selected['region'],account_id=selected['id'],model=response_model)
-            cap=controls(m)['max_output_tokens']
-            if chat.get('max_tokens') and number(cap) and cap>0:
-                row['requested_max_tokens']=chat['max_tokens'];chat['max_tokens']=min(chat['max_tokens'],int(cap));row['effective_max_tokens']=chat['max_tokens']
-            unavailable=tool_specs(body)[1] if response_api else []
-            if unavailable:row['unavailable_server_tools']=unavailable
-            rid=row['id']; headers={'X-Model-ID':chat['model'],'X-Agent-Intent':'craft','X-Agent-Purpose':'conversation','x-codebuddy-request':'1','X-Private-Data':'true',**conversation_headers(chat,req.headers.get('X-Conversation-ID'))}
-            upstream=await self.call(selected['region'],'/v2/chat/completions',selected,'POST',prepare(chat,selected['region']),headers,stream=True)
+            candidates.sort(key=lambda rm:(self.busy.get(rm[0]['id'],0),self.last_picked.get(rm[0]['id'],0),rm[0]['id']))
+            # Failover before the first byte reaches the client: a rate-limited or transiently
+            # failing account is replaced by the next candidate instead of making the caller wait
+            # out the cooldown. Once the response has started streaming there is nothing to replay,
+            # so those failures are reported in-band (see the except block below).
+            tried=set(); last=None; attempts=0
+            while True:
+                live=[rm for rm in candidates if rm[0]['id'] not in tried and self.busy.get(rm[0]['id'],0)<8 and rm[0]['id'] not in self.switching and not rm[0].get('needsAccountSync') and not self.risk.block(rm[0]['region'],rm[0]['id'],'/v2/chat/completions')]
+                if not live:
+                    if last is not None: raise last
+                    require(False,'Unsupported model parameters or all matching accounts busy' if exists else 'Model not available',400 if exists else 404,'unsupported_model_parameter' if exists else 'model_not_found')
+                selected,m=live[0]; tried.add(selected['id']); self.busy[selected['id']]=self.busy.get(selected['id'],0)+1; self.last_picked[selected['id']]=time.monotonic(); busy_acquired=True
+                try:
+                    selected=await self.refresh(selected); response_model=public_model(selected['region'],chat['model']); row.update(region=selected['region'],account_id=selected['id'],model=response_model)
+                    cap=controls(m)['max_output_tokens']
+                    if chat.get('max_tokens') and number(cap) and cap>0:
+                        row['requested_max_tokens']=chat['max_tokens'];chat['max_tokens']=min(chat['max_tokens'],int(cap));row['effective_max_tokens']=chat['max_tokens']
+                    unavailable=tool_specs(body)[1] if response_api else []
+                    if unavailable:row['unavailable_server_tools']=unavailable
+                    rid=row['id']; headers={'X-Model-ID':chat['model'],'X-Agent-Intent':'craft','X-Agent-Purpose':'conversation','x-codebuddy-request':'1','X-Private-Data':'true',**conversation_headers(chat,req.headers.get('X-Conversation-ID'))}
+                    upstream=await self.call(selected['region'],'/v2/chat/completions',selected,'POST',prepare(chat,selected['region']),headers,stream=True)
+                    break
+                except Fault as e:
+                    self.busy[selected['id']]=max(0,self.busy.get(selected['id'],0)-1); busy_acquired=False; attempts+=1
+                    if not failover_allowed(e) or attempts>=MAX_FAILOVER: raise
+                    row.setdefault('failover',[]).append({'account_id':selected['id'],'status':getattr(e,'status',502),'code':getattr(e,'code','upstream_error'),'at_ms':round((time.monotonic()-start)*1000,2)})
+                    last=e
             async def emit(event,data):
                 payload=('event: '+event+chr(10) if event else '')+'data: '+(data if isinstance(data,str) else json.dumps(data,ensure_ascii=False,separators=(',',':')))+chr(10)*2
                 await stream_response.write(payload.encode())
