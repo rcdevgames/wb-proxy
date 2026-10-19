@@ -55,6 +55,10 @@ class Risk:
         self.store=store
         changed=False
         for e in store.risks:
+            # A pause that names an account which is no longer stored blocks nothing and
+            # cannot be acted on: deleting the account is the resolution.
+            if e.get('scope')=='account' and e.get('account_id') and not e.get('resolved_at') and e['account_id'] not in store.records:
+                e.update(resolved_at=now(),resolution='account_removed');changed=True
             if e.get('kind')=='channel_not_allowed' and e.get('scope')=='region' and str(e.get('upstream_code'))=='11128':
                 e.update(scope='request',manual=False,retry_at=0,diagnostic_only=True,scope_corrected_at=now());changed=True
             if e.get('kind')=='rate_limited' and e.get('scope')=='region' and e.get('account_id'):

@@ -82,8 +82,10 @@ Stop the service first: a running instance holds the decrypted store in memory a
 Behaviour shared by both paths:
 
 - The region is read from the token's own `iss` claim (`*.workbuddy.cn` / `*.codebuddy.cn` → CN, `*.workbuddy.ai` / `*.codebuddy.ai` → GL), so no region has to be picked by hand.
-- The token is exchanged for an access token and the profile is read from upstream, so the account is usable immediately and refreshable afterwards.
-- Re-importing is safe: accounts are matched on `uid` + `enterpriseId` and updated in place instead of duplicated.
+- Two token kinds are accepted. An offline token (`typ: Offline`) is exchanged for an access token and stays refreshable. A console session token (`typ: Bearer`, what the web console hands out) is not a refresh token — `POST /v2/plugin/auth/token/refresh` answers `12153 invalid_grant` for it — so it is stored as an access-only account that serves requests until its own `exp` (usually a year) and is reported with `refreshable: false`. Re-import a fresh session token before that date to extend it.
+- The token is verified against upstream (`/v2/plugin/accounts`) before it is stored, so the account is usable immediately.
+- Re-importing is safe: accounts are matched on `uid` + `enterpriseId` and updated in place instead of duplicated. A `login_required` pause on the account is cleared by the import.
+- A pause that names an account which is no longer in the store blocks nothing and cannot be acted on, so it is resolved automatically (`resolution: account_removed`) at startup instead of sitting in the console as a manual action.
 - The line's `name` is kept as the account label and shown as the row subtitle in the console (the upstream nickname remains the account title).
 - Token values are never returned: the UI shows only per-line status and, on failure, an error code/message with the token redacted. Limits: 2 MB of text and 50 lines per import.
 

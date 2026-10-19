@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-19 — import accepts a console session token
+
+- `wb_gateway/server.py`: a token whose JWT `typ` is `Bearer` (what the web console exports) is no
+  longer sent to `/v2/plugin/auth/token/refresh`, which answers `12153 invalid_grant` for it and used
+  to fail the whole line. It is stored as an access-only account with `expiresAt` from its own `exp`
+  and `auth_type: access_token` in the import result; `typ: Offline` still goes through the refresh
+  exchange. `refresh()` now says "holds an access token only" instead of "Session expired" for those.
+- `wb_gateway/models.py`: a `login_required` (or any account-scoped) pause that names an account no
+  longer in the store is resolved at startup with `resolution: account_removed` — that is why the
+  console kept showing "GL · Login required again / manual action still required" for ten accounts
+  that had already been dropped, after the cooldown had expired.
+- `tests/test_token_import.py`: 5 tests (access token stored without a refresh call, offline token
+  still refreshed, expired access token rejected, pause for a removed account resolved, pause for a
+  stored account kept) — 31 tests together, all passing.
+- `RUNNING.md`: documents both token kinds and the automatic resolution of orphaned pauses.
+
 ## 2026-10-16 — a rate limit belongs to the account, not the region
 
 - `wb_gateway/models.py`: `429` now records `scope='account'` (was `'region'`); `block()` is the

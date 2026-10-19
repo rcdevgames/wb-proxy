@@ -116,7 +116,7 @@ class Gateway:
         if r['id'] in self.refresh_tasks: return await asyncio.shield(self.refresh_tasks[r['id']])
         if not force and (not r['auth'].get('expiresAt') or r['auth']['expiresAt']>stamp()+60000): return r
         async def work():
-            a=r['auth']; require(a.get('refreshToken') and (not a.get('refreshExpiresAt') or a['refreshExpiresAt']>stamp()),'Session expired; log in again',401,'login_required')
+            a=r['auth']; require(a.get('refreshToken'),'This account holds an access token only; import a fresh token',401,'login_required'); require(not a.get('refreshExpiresAt') or a['refreshExpiresAt']>stamp(),'Session expired; log in again',401,'login_required')
             data=unpack(await self.call(r['region'],'/v2/plugin/auth/token/refresh',r,'POST',{}, {'X-Refresh-Token':a['refreshToken'],'X-Auth-Refresh-Source':'plugin'}))
             nxt={**r,'auth':auth_values(data,a)}; self.store.put(nxt)
             rows=unpack(await self.call(r['region'],'/v2/plugin/accounts',nxt)); rows=rows if isinstance(rows,list) else rows.get('accounts',[])
@@ -247,8 +247,17 @@ class Gateway:
                 require(region,'Unrecognised token issuer',400,'unknown_issuer')
                 expires=claims.get('exp'); require(type(expires) not in (int,float) or expires>time.time(),'Token already expired',400,'token_expired')
                 pending={'id':uid(region+'_'),'region':region,'account':{},'auth':{'refreshToken':token},'needsAccountSync':True}
-                data=unpack(await self.call(region,'/v2/plugin/auth/token/refresh',pending,'POST',{}, {'X-Refresh-Token':token,'X-Auth-Refresh-Source':'plugin'}))
-                pending['auth']=auth_values(data,pending['auth'])
+                # A console session token (typ Bearer) authenticates every API call but is
+                # not a refresh token: /auth/token/refresh answers 12153 invalid_grant for
+                # it. Store it as an access-only account that lives until its own exp.
+                access_only=str(claims.get('typ','')).lower()=='bearer'
+                if access_only:
+                    require(number(expires),'Access token carries no expiry',400,'token_expired')
+                    pending['auth']={'accessToken':token,'expiresAt':int(expires*1000),'lastRefreshTime':stamp()}
+                else:
+                    data=unpack(await self.call(region,'/v2/plugin/auth/token/refresh',pending,'POST',{}, {'X-Refresh-Token':token,'X-Auth-Refresh-Source':'plugin'}))
+                    pending['auth']=auth_values(data,pending['auth'])
+                row['auth_type']='access_token' if access_only else 'refresh_token'
                 listing=unpack(await self.call(region,'/v2/plugin/accounts',pending))
                 accounts=listing if isinstance(listing,list) else listing.get('accounts',[])
                 require(accounts,'No accounts returned by upstream',502)
