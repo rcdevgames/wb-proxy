@@ -16,8 +16,8 @@ def atomic(path, value):
 def read(path,default):
     return json.loads(Path(path).read_text(encoding='utf-8-sig')) if Path(path).exists() else default
 class Fault(Exception):
-    def __init__(self,status,message,code='invalid_request',risk=None):
-        super().__init__(message); self.status=status; self.code=code; self.risk=risk
+    def __init__(self,status,message,code='invalid_request',risk=None,retry_after=None):
+        super().__init__(message); self.status=status; self.code=code; self.risk=risk; self.retry_after=retry_after
 def require(ok,message,status=400,code='invalid_request'):
     if not ok: raise Fault(status,message,code)
 def unpack(body):
@@ -25,6 +25,28 @@ def unpack(body):
     require(not body.get('error') and body.get('code') in (None,0,200,'0','200'),'Official API rejected request',502,'upstream_error')
     return body.get('data',body)
 def safe_error(e): return {'message':str(e) if isinstance(e,Fault) else 'Request failed','code':getattr(e,'code','request_failed'),'status':getattr(e,'status',502)}
+# A key may run this many requests at once unless it says otherwise.
+DEFAULT_MAX_CONCURRENCY=2
+def key_limits(body,base=None):
+    out={'models':[],'rpm':0,'max_concurrency':DEFAULT_MAX_CONCURRENCY}
+    out.update(base or {})
+    if 'models' in body:
+        raw=body['models'] if body['models'] is not None else []
+        require(isinstance(raw,list),'models must be a list of model IDs')
+        patterns=[]
+        for item in raw:
+            require(isinstance(item,str),'Model IDs must be strings')
+            item=item.strip(); require(0<len(item)<=120,'Invalid model ID')
+            if item not in patterns: patterns.append(item)
+        require(len(patterns)<=200,'Too many models on one key')
+        out['models']=patterns
+    for field,ceiling in (('rpm',100000),('max_concurrency',1000)):
+        if field in body:
+            try: value=int(body[field] or 0)
+            except (TypeError,ValueError): raise Fault(400,field+' must be a whole number')
+            require(0<=value<=ceiling,field+' must be between 0 and '+str(ceiling))
+            out[field]=value
+    return out
 class Store:
     def __init__(self,root):
         self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
@@ -41,6 +63,7 @@ class Store:
             rows=json.loads(raw); require(isinstance(rows,list),'Invalid credential store',500)
             self.records={r['id']:r for r in rows}
         self.keys=read(self.root/'api-keys.json',{'version':1,'keys':[]})['keys']
+        for k in self.keys: k.update(key_limits({},k))
         self.risks=read(self.root/'risk-state.json',{'version':1,'entries':[]})['entries']
         self.logs=[]
         lp=self.root/'call-logs.jsonl'
@@ -66,8 +89,17 @@ class Store:
             except (ValueError,TypeError): valid=False
             require(valid,'Invalid key expiration')
         secret='sk-wb-'+secrets.token_urlsafe(32)
-        r={'id':str(uuid.uuid4()),'name':name,'scope':scope,'prefix':secret[:14],'digest':hashlib.sha256(secret.encode()).hexdigest(),'enabled':True,'created_at':now(),'expires_at':expiry,'last_used_at':None}
+        r={'id':str(uuid.uuid4()),'name':name,'scope':scope,'prefix':secret[:14],'digest':hashlib.sha256(secret.encode()).hexdigest(),'enabled':True,'created_at':now(),'expires_at':expiry,'last_used_at':None,**key_limits(b)}
         self.keys.append(r); self.save_keys(); return {**{k:v for k,v in r.items() if k!='digest'},'key':secret}
+    def update_key(self,key_id,body):
+        row=next((k for k in self.keys if k['id']==key_id),None)
+        if row is None: raise Fault(404,'API key not found','key_not_found')
+        if 'name' in body:
+            name=str(body['name'] or '').strip(); require(0<len(name)<=80,'Key name required'); row['name']=name
+        if 'enabled' in body: row['enabled']=bool(body['enabled'])
+        if 'expires_at' in body: row['expires_at']=body['expires_at'] or None
+        row.update(key_limits(body,row)); self.save_keys()
+        return {k:v for k,v in row.items() if k!='digest'}
     def authenticate(self,secret):
         digest=hashlib.sha256(secret.encode()).hexdigest()
         for r in self.keys:

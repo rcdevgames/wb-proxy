@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-19 — per-key models, RPM and parallel cap
+
+- `wb_gateway/limits.py` (new): `model_allowed` matches region-qualified model IDs against the key's
+  allowlist (exact IDs or `fnmatch` globs; empty list = everything), and `KeyLimits` holds the
+  in-memory counters — a sliding 60-second RPM window and per-key in-flight slots.
+- `wb_gateway/storage.py`: key records gained `models`, `rpm` and `max_concurrency`; `key_limits()`
+  validates them (200 patterns max, 120 chars each, RPM 0–100000, concurrency 0–1000, `0` = no cap),
+  `new_key()` stores them, `update_key()` edits them, and records written before this change pick up
+  the defaults on load. `Fault` gained `retry_after`.
+- `wb_gateway/server.py`: `generate` and `/v1/messages/count_tokens` charge the RPM budget and take a
+  parallel slot before reading the body (released in `finally`); a model outside the allowlist is
+  `403 model_not_allowed`; `model_list` filters the catalogue by the calling key and flags the result
+  `restricted`; `POST /admin/keys/{id}` edits a key; `GET /admin/keys` reports live in-flight counts;
+  429 responses now carry `Retry-After`.
+- `web/`: the Keys page has Models / Requests per minute / Max parallel on the create form and in a
+  new Edit dialog, with a searchable model picker built from the live catalogue; cards show the limits
+  and whether the key is idle or running.
+- `tests/test_key_limits.py`: 14 tests — glob matching, RPM window, default parallel cap of 2,
+  record validation and migration, filtered `/v1/models`, 403 vs 404, 429 + `Retry-After`, the
+  parallel cap under a slow upstream, and editing a live key through the admin endpoint.
+- Default for every key, including ones created earlier, is **2 parallel requests** and no RPM cap.
+
 ## 2026-10-19 — import accepts a console session token
 
 - `wb_gateway/server.py`: a token whose JWT `typ` is `Bearer` (what the web console exports) is no

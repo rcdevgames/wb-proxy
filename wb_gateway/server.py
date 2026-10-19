@@ -6,6 +6,7 @@ from .responses_compat import tool_specs
 from .anthropic import anthropic_to_chat, AnthropicWriter, anthropic_error
 from .storage import Store, Fault, require, unpack, now, stamp, atomic, read, uid, safe_error
 from .models import Risk, visible, controls, quote, number
+from .limits import KeyLimits, model_allowed, model_patterns
 from .protocol import validate_chat, prepare, conversation_headers, responses_to_chat, chunks, heartbeat_chunks, Accumulator, ResponsesWriter, contract, read_bounded
 
 def network_proxy():
@@ -62,7 +63,7 @@ class Gateway:
         self.test_origins=test_origins; keys=read(self.store.root/'keys.json',{})
         self.admin_key=admin_key or os.environ.get('WB_ADMIN_KEY') or keys.get('admin_key') or secrets.token_urlsafe(32)
         if not admin_key and not os.environ.get('WB_ADMIN_KEY') and not keys.get('admin_key'): atomic(self.store.root/'keys.json',{**keys,'admin_key':self.admin_key})
-        self.risk=Risk(self.store); self.sessions={}; self.pending={}; self.jobs={}; self.active_job=None; self.busy={}; self.switching=set(); self.locks={}; self.refresh_tasks={}; self.catalogs={}; self.catalog_tasks={}; self.last_picked={}; self.tasks=set()
+        self.risk=Risk(self.store); self.limits=KeyLimits(); self.sessions={}; self.pending={}; self.jobs={}; self.active_job=None; self.busy={}; self.switching=set(); self.locks={}; self.refresh_tasks={}; self.catalogs={}; self.catalog_tasks={}; self.last_picked={}; self.tasks=set()
         self.proxy,self.proxy_source=network_proxy()
         if self.proxy: require(urllib.parse.urlsplit(self.proxy).scheme in ('http','https'),'Only HTTP(S) network proxies supported',500)
         self.allowed_origins=set(filter(None,os.environ.get('WB_ALLOWED_ORIGINS','').split(',')))
@@ -161,15 +162,18 @@ class Gateway:
             e=max(restricted,key=lambda x:x['risk'].get('retry_at',0))['risk']
             raise Fault(e.get('status',429),e.get('action','Upstream restriction active'),'risk_'+e['kind'],e)
         require(out,'No live model catalogs available',503,'catalog_unavailable'); return out,errors
-    async def model_list(self,scope,region=None):
-        rows,errors=await self.catalogs_for(scope,internal_region(region)); by={}
+    async def model_list(self,scope,region=None,key=None):
+        rows,errors=await self.catalogs_for(scope,internal_region(region)); by={}; patterns=model_patterns(key or {})
         for r,models in rows:
             for m in models:
                 mid=public_model(r['region'],m['id'])
                 if mid in by: continue
+                if patterns and not model_allowed(key,mid): continue
                 region_id=public_region(r['region']); c=controls(m)
                 by[mid]={'id':mid,'object':'model','created':0,'owned_by':'workbuddy','metadata':{'region':region_id,'regions':[region_id],'account_region':r['region'],'upstream_model':m['id'],'capabilities_by_region':[{'region':region_id,'source':'live','regional_id':mid,'capabilities':c}],'max_input_tokens':c['max_input_tokens'],'max_output_tokens':c['max_output_tokens'],'reasoning_efforts':c['efforts'],'supports_tools':c['supports_tools'],'supports_images':c['supports_images']}}
-        return {'object':'list','data':[by[k] for k in sorted(by)],'partial':bool(errors),'note':'Region-qualified IDs: cn/ for China, gl/ for Global. Use the returned ID unchanged in requests. Model parameters remain client controlled.'}
+        # The list is the key's own view: a restricted key sees only what it may call, so a
+        # client that enumerates models never offers a request the gateway would refuse.
+        return {'object':'list','data':[by[k] for k in sorted(by)],'partial':bool(errors),**({'restricted':True,'allowed_models':patterns} if patterns else {}),'note':'Region-qualified IDs: cn/ for China, gl/ for Global. Use the returned ID unchanged in requests. Model parameters remain client controlled.'}
     async def pricing(self,region,account=None):
         require(region in ('cn','intl'),'Invalid region'); allrows=self.accounts(region); rows=self.accounts(region,account=account)
         if account: require(rows,'Account not found',404)
@@ -350,6 +354,9 @@ class Gateway:
         credits=[r['credit'] for r in rows if number(r.get('credit'))]
         return {'data':rows[(page-1)*limit:page*limit],'total':len(rows),'page':page,'limit':limit,'key_options':options,'summary':{'requests':len(rows),'known_credit':sum(credits),'credit_known':len(credits),'credit_unknown':len(rows)-len(credits),'request_bytes':sum(r.get('request_bytes',0) for r in rows)},'retention_days':30,'max_entries':10000,'storage_error':None}
     async def generate(self,req,principal):
+        # Limits are charged before the body is read so a key cannot spend the gateway's
+        # bandwidth or an account slot while it is over budget.
+        self.limits.charge(principal); self.limits.acquire(principal)
         start=time.monotonic(); raw=await req.read()
         row={'id':uid('req_'),'started_at':now(),'endpoint':req.path,'request_ip':request_ip(req),'api_key_id':principal['id'],'api_key_name':principal.get('name'),'api_key_prefix':principal.get('prefix'),'request_bytes':len(raw),'status_code':200,'outcome':'pending','credit':None,'credit_source':None,'first_token_ms':None,'first_text_ms':None,'reasoning_ms':None,'reasoning_timing_source':None,'latency_source':None,'input_tokens':None,'output_tokens':None,'reasoning_tokens':None}
         stream_response=None; upstream=None; selected=None; busy_acquired=False; writer=None; reasoning_start=None; reasoning_end=None; last_reason=None
@@ -362,13 +369,17 @@ class Gateway:
             if sep and prefix in ('cn','gl','intl'):
                 resolved=internal_region(prefix); require(not region or region==resolved,'Conflicting region'); region=resolved; chat['model']=mid
             elif sep: raise Fault(400,'Use a cn/ or gl/ model ID','invalid_model_region')
-            catalogs,errors=await self.catalogs_for(principal['scope'],region,req.headers.get('X-WB-Account')); candidates=[]; blocked=[e['risk'] for e in errors if e.get('risk')]; exists=False
+            catalogs,errors=await self.catalogs_for(principal['scope'],region,req.headers.get('X-WB-Account')); candidates=[]; blocked=[e['risk'] for e in errors if e.get('risk')]; exists=False; denied=False
             matching_regions={r['region'] for r,models in catalogs if any(m['id']==chat['model'] for m in models)}
             require(region or len(matching_regions)<=1,'Model exists in both regions; select cn/'+chat['model']+' or gl/'+chat['model'],400,'ambiguous_model_region')
             for r,models in catalogs:
                 m=next((m for m in models if m['id']==chat['model']),None)
                 if not m: continue
-                exists=True; c=controls(m)
+                exists=True
+                # An allowlist refusal is reported as such, not as an unknown model, so the
+                # caller can tell a typo from a key that is simply not provisioned for it.
+                if not model_allowed(principal,public_model(r['region'],chat['model'])): denied=True; continue
+                c=controls(m)
                 # A requested maximum is a ceiling; cap it to the selected model's real limit.
                 if chat.get('reasoning_effort') and c['efforts'] and chat['reasoning_effort'] not in c['efforts']: continue
                 if chat.get('tools') and not c['supports_tools']: continue
@@ -378,6 +389,8 @@ class Gateway:
                 restriction=self.risk.block(r['region'],r['id'],'/v2/chat/completions')
                 if restriction: blocked.append(restriction); continue
                 candidates.append((r,m))
+            if not candidates and denied:
+                raise Fault(403,'This API key may not use '+(public_model(region,chat['model']) if region else chat['model']),'model_not_allowed')
             if not candidates and blocked:
                 restriction=max(blocked,key=lambda e:e.get('retry_at',0))
                 raise Fault(restriction.get('status',429),restriction.get('action','Upstream restriction active'),'risk_'+restriction['kind'],restriction)
@@ -449,6 +462,7 @@ class Gateway:
                 await stream_response.write_eof(); return stream_response
             raise e
         finally:
+            self.limits.release(principal['id'])
             if upstream is not None: upstream.close()
             if selected and busy_acquired: self.busy[selected['id']]=max(0,self.busy.get(selected['id'],1)-1)
             if reasoning_start is not None and upstream is not None and 'text/event-stream' in upstream.headers.get('Content-Type',''):
@@ -484,13 +498,13 @@ class Gateway:
             if len(parts)==4 and parts[1]=='risk' and parts[3]=='resume' and method=='POST':
                 b=await json_body(req); require(b.get('official_issue_resolved') is True,'Official issue resolution must be confirmed'); e=next((x for x in self.store.risks if x['id']==parts[2]),None); require(e,'Restriction not found',404); e['resolved_at']=now(); self.risk.save(); return jresponse({'resumed':True,'replayed':False})
             if path=='/admin/keys':
-                if method=='GET': return jresponse({'keys':self.store.public_keys(),'legacy_api_key_enabled':False,'base_path':'/v1'})
+                if method=='GET': return jresponse({'keys':self.store.public_keys(),'active':self.limits.snapshot(),'legacy_api_key_enabled':False,'base_path':'/v1'})
                 if method=='POST': return jresponse(self.store.new_key(await json_body(req)),201)
             if len(parts)==3 and parts[1]=='keys':
                 k=next((x for x in self.store.keys if x['id']==parts[2]),None); require(k,'Key not found',404)
                 if method=='DELETE': self.store.keys.remove(k); self.store.save_keys(); return jresponse({'revoked':True})
                 if method=='POST':
-                    b=await json_body(req); require(type(b.get('enabled')) is bool,'enabled must be boolean'); k['enabled']=b['enabled']; self.store.save_keys(); return jresponse({a:v for a,v in k.items() if a!='digest'})
+                    return jresponse(self.store.update_key(parts[2],await json_body(req)))
             if path=='/admin/login' and method=='POST': return jresponse(await self.new_login((await json_body(req)).get('region','cn')),201)
             if len(parts)==3 and parts[1]=='login':
                 if method=='GET': return jresponse(await self.poll_login(parts[2]))
@@ -518,15 +532,17 @@ class Gateway:
             raise Fault(404,'Unknown admin route','not_found')
         auth=req.headers.get('Authorization',''); token=auth[7:] if auth.startswith('Bearer ') else req.headers.get('x-api-key',''); principal=self.store.authenticate(token)
         if (path=='/v1/models' or path.startswith('/v1/models/')) and method=='GET':
-            result=await self.model_list(principal['scope'],req.headers.get('X-WB-Region') or req.query.get('region'))
+            result=await self.model_list(principal['scope'],req.headers.get('X-WB-Region') or req.query.get('region'),principal)
             if path!='/v1/models':
                 requested_id=path[len('/v1/models/'):]; requested_id='gl/'+requested_id[5:] if requested_id.startswith('intl/') else requested_id
                 model=next((m for m in result['data'] if m['id']==requested_id),None); require(model,'Model not found',404,'model_not_found'); result=model
             return jresponse(result)
         if path=='/v1/messages/count_tokens' and method=='POST':
+            self.limits.charge(principal)
             body=await json_body(req);model=body.get('model','');prefix,sep,mid=model.partition('/')
             if sep and prefix in ('cn','gl','intl'):
                 region=internal_region(prefix);require(principal['scope']=='all' or principal['scope']==region,'Key cannot access this region',403)
+                require(model_allowed(principal,public_model(region,mid)),'This API key may not use '+public_model(region,mid),403,'model_not_allowed')
             payload={k:body[k] for k in ('system','messages','tools') if k in body}
             require(isinstance(body.get('messages'),list),'messages required')
             # Advisory estimate only: the upstream does not expose an exact tokenizer.
@@ -567,7 +583,9 @@ def create_app(gateway):
         except web.HTTPRequestEntityTooLarge: result=jresponse(error_body(Fault(413,'Request body too large','body_too_large')),413)
         except Fault as e:
             result=jresponse(anthropic_error(e) if req.path.startswith('/v1/messages') else error_body(e),e.status)
+            wait=getattr(e,'retry_after',None)
             if e.risk: result.headers['Retry-After']=str(max(0,int((e.risk.get('retry_at',stamp())-stamp()+999)//1000)))
+            elif wait is not None: result.headers['Retry-After']=str(wait)
         except asyncio.CancelledError: raise
         except Exception: result=jresponse(error_body(Fault(500,'Internal request failure','internal_error')),500)
         if allowed and origin and not result.prepared:

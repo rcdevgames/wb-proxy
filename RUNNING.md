@@ -89,6 +89,18 @@ Behaviour shared by both paths:
 - The line's `name` is kept as the account label and shown as the row subtitle in the console (the upstream nickname remains the account title).
 - Token values are never returned: the UI shows only per-line status and, on failure, an error code/message with the token redacted. Limits: 2 MB of text and 50 lines per import.
 
+## Per-key limits
+
+Each API key carries three limits, editable in Admin → Keys (create form, and **Edit** on a key card):
+
+- **Models** — a comma-separated allowlist of region-qualified IDs (`gl/deepseek-v4.1-flash`) or globs (`cn/*`). Empty means every model. `GET /v1/models` returns only what the key may call, and a request outside the list is `403 model_not_allowed` (an ID that does not exist at all stays `404 model_not_found`).
+- **Requests / minute** — a sliding 60-second window. Over budget: `429 key_rate_limited` with `Retry-After`.
+- **Max parallel** — in-flight requests for that key. Over budget: `429 key_concurrency_limit` with `Retry-After`. Default is **2**; `0` disables the cap.
+
+The limits live on the key record in `data/api-keys.json`, so they survive a restart and older key records pick up the defaults on load. The counters are memory-only by design: a restart forgets requests that were already in flight. The Keys page shows the live in-flight count per key.
+
+Limits are charged before the request body is read, so an over-budget key cannot consume bandwidth or an account slot.
+
 ## Notes
 
 - `pm2 save` has been run, so the process is part of the saved PM2 dump.
