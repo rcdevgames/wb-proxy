@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-19 — mobile layout: no more sideways scrolling
+
+- `web/style.css`: the Keys page grid used `1fr` tracks whose automatic minimum size was the widest
+  child, so at 390 px the create panel grew to 429 px and the whole page scrolled left/right. Tracks
+  are now `minmax(0,1fr)` with `min-width:0` on the create-form children and `width:100%` on its
+  inputs, and `.main-shell` clips stray horizontal overflow (`overflow-x:clip`, which keeps the
+  sticky sidebar and the inner table scrollers working).
+- Verified in an emulated browser at 320/360/375/390/414/430 (portrait) and 667/736/812 (landscape):
+  `documentElement.scrollWidth === innerWidth` on Accounts, Pricing, Logs and Keys, and no element
+  extends past the viewport. Desktop (1440 px) still renders 260 px + flexible columns with the
+  sticky sidebar.
+
 ## 2026-10-19 — per-key models, RPM and parallel cap
 
 - `wb_gateway/limits.py` (new): `model_allowed` matches region-qualified model IDs against the key's
