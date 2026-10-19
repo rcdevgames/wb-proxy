@@ -6,7 +6,7 @@ and a request that exceeds the budget is refused before an account is touched.
 
 Run: ./.venv/bin/python -m unittest discover -s tests -v
 """
-import asyncio, json, sys, tempfile, unittest
+import asyncio, hashlib, json, sys, tempfile, unittest
 from pathlib import Path
 
 from aiohttp import web, ClientSession
@@ -126,6 +126,45 @@ class KeyRecords(unittest.TestCase):
         for body in ({'rpm': -1}, {'max_concurrency': 'lots'}, {'models': 'gl/x'}):
             with self.assertRaises(Fault):
                 store.new_key({'name': 'client', **body})
+
+
+class KeySecrets(unittest.TestCase):
+    def store(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        return Gateway(ROOT, data_dir=tmp.name, config={}, admin_key='admin-test').store
+
+    def test_the_secret_can_be_read_back_but_never_leaves_the_ciphertext(self):
+        store = self.store()
+        created = store.new_key({'name': 'client'})
+        listed = store.public_keys()[0]
+        self.assertEqual(listed['key'], created['key'])
+        self.assertEqual(listed['prefix'], created['key'][:14])
+        self.assertNotIn('digest', listed)
+        self.assertNotIn('secret_enc', listed)
+        self.assertNotIn(created['key'], json.dumps(store.keys))
+
+    def test_the_secret_survives_a_reload(self):
+        store = self.store()
+        created = store.new_key({'name': 'client'})
+        reopened = type(store)(store.root)
+        self.assertEqual(reopened.public_keys()[0]['key'], created['key'])
+
+    def test_a_rotated_key_gets_a_new_secret_and_the_old_one_stops_working(self):
+        store = self.store()
+        created = store.new_key({'name': 'client'})
+        rotated = store.update_key(created['id'], {'rotate': True})
+        self.assertNotEqual(rotated['key'], created['key'])
+        self.assertEqual(rotated['prefix'], rotated['key'][:14])
+        self.assertEqual(store.authenticate(rotated['key'])['id'], created['id'])
+        with self.assertRaises(Fault):
+            store.authenticate(created['key'])
+
+    def test_a_key_stored_before_secrets_were_kept_has_no_readable_secret(self):
+        store = self.store()
+        store.keys.append({'id': 'old', 'name': 'legacy', 'scope': 'all', 'prefix': 'legacy-prefix', 'digest': hashlib.sha256(b'legacy-secret').hexdigest(), 'enabled': True, 'created_at': '2026-01-01T00:00:00.000Z', 'expires_at': None, 'last_used_at': None})
+        self.assertIsNone(store.public_keys()[0]['key'])
+        self.assertEqual(store.authenticate('legacy-secret')['id'], 'old')
+        self.assertTrue(store.update_key('old', {'rotate': True})['key'].startswith('sk-wb-'))
 
     def test_a_legacy_key_record_gets_the_defaults_on_load(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-19 — keys can be copied again, without unmasking the list
+
+- `data/api-keys.json` now keeps each key's secret as AES-GCM ciphertext (`secret_enc`, sealed with
+  `data/master.key`), next to the existing SHA-256 `digest`. The digest is still what
+  `/v1/*` authenticates against; the ciphertext is only for showing the key back to the admin.
+- `GET /admin/keys` returns the decrypted `key` field (admin token required, `digest` and
+  `secret_enc` never leave the store), so the console can put the full key on the clipboard while
+  the card keeps showing `sk-wb-…` only.
+- Each key card has a **Copy** button; **Edit → New secret** rotates a key (confirm dialog, old
+  secret stops working immediately) and shows the new one in the usual dialog.
+- Keys created before this change have no stored secret — the plaintext is gone and cannot be
+  recovered. Their Copy button is disabled and points at **New secret**, which is the only way to
+  make an old key copyable again.
+- Tests: `KeySecrets` covers round-trip, reload, rotation (old secret rejected) and the legacy
+  no-secret case — 49 tests pass.
+
 ## 2026-10-19 — mobile layout: no more sideways scrolling
 
 - `web/style.css`: the Keys page grid used `1fr` tracks whose automatic minimum size was the widest

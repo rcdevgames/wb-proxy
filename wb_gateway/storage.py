@@ -79,7 +79,19 @@ class Store:
     def put(self,record): self.records[record['id']]=record; self.save()
     def public(self,r): return {'id':r['id'],'region':r['region'],'account':r.get('account',{}),'expires_at':r.get('auth',{}).get('expiresAt'),'refreshable':bool(r.get('auth',{}).get('refreshToken')),'label':r.get('import_label')}
     def save_keys(self): atomic(self.root/'api-keys.json',{'version':1,'keys':self.keys})
-    def public_keys(self): return [{k:v for k,v in r.items() if k!='digest'} for r in self.keys]
+    def seal(self,secret):
+        iv=secrets.token_bytes(12)
+        return base64.b64encode(iv).decode()+'.'+base64.b64encode(AESGCM(self.key).encrypt(iv,secret.encode(),b'wb-api-key-v1')).decode()
+    def unseal(self,blob):
+        try:
+            iv,body=blob.split('.',1)
+            return AESGCM(self.key).decrypt(base64.b64decode(iv),base64.b64decode(body),b'wb-api-key-v1').decode()
+        except Exception: return None
+    def public_key(self,r):
+        out={k:v for k,v in r.items() if k not in ('digest','secret_enc')}
+        out['key']=self.unseal(r['secret_enc']) if r.get('secret_enc') else None
+        return out
+    def public_keys(self): return [self.public_key(r) for r in self.keys]
     def new_key(self,b):
         name=b.get('name','').strip(); scope=b.get('scope','all')
         require(0<len(name)<=80,'Key name required'); require(scope in ('cn','intl','all'),'Invalid scope')
@@ -89,8 +101,8 @@ class Store:
             except (ValueError,TypeError): valid=False
             require(valid,'Invalid key expiration')
         secret='sk-wb-'+secrets.token_urlsafe(32)
-        r={'id':str(uuid.uuid4()),'name':name,'scope':scope,'prefix':secret[:14],'digest':hashlib.sha256(secret.encode()).hexdigest(),'enabled':True,'created_at':now(),'expires_at':expiry,'last_used_at':None,**key_limits(b)}
-        self.keys.append(r); self.save_keys(); return {**{k:v for k,v in r.items() if k!='digest'},'key':secret}
+        r={'id':str(uuid.uuid4()),'name':name,'scope':scope,'prefix':secret[:14],'digest':hashlib.sha256(secret.encode()).hexdigest(),'secret_enc':self.seal(secret),'enabled':True,'created_at':now(),'expires_at':expiry,'last_used_at':None,**key_limits(b)}
+        self.keys.append(r); self.save_keys(); return {**self.public_key(r)}
     def update_key(self,key_id,body):
         row=next((k for k in self.keys if k['id']==key_id),None)
         if row is None: raise Fault(404,'API key not found','key_not_found')
@@ -98,8 +110,12 @@ class Store:
             name=str(body['name'] or '').strip(); require(0<len(name)<=80,'Key name required'); row['name']=name
         if 'enabled' in body: row['enabled']=bool(body['enabled'])
         if 'expires_at' in body: row['expires_at']=body['expires_at'] or None
-        row.update(key_limits(body,row)); self.save_keys()
-        return {k:v for k,v in row.items() if k!='digest'}
+        row.update(key_limits(body,row))
+        if body.get('rotate'):
+            secret='sk-wb-'+secrets.token_urlsafe(32)
+            row.update({'prefix':secret[:14],'digest':hashlib.sha256(secret.encode()).hexdigest(),'secret_enc':self.seal(secret)})
+        self.save_keys()
+        return self.public_key(row)
     def authenticate(self,secret):
         digest=hashlib.sha256(secret.encode()).hexdigest()
         for r in self.keys:

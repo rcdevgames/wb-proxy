@@ -101,6 +101,16 @@ The limits live on the key record in `data/api-keys.json`, so they survive a res
 
 Limits are charged before the request body is read, so an over-budget key cannot consume bandwidth or an account slot.
 
+## Copying a key
+
+Each key card shows only `sk-wb-…` (the prefix) so a screenshot of the console cannot leak a working
+key. **Copy** puts the full key on the clipboard without unmasking the card. The plaintext lives in
+`data/api-keys.json` as AES-GCM ciphertext sealed with `data/master.key` and is returned only by the
+admin-authenticated `GET /admin/keys`; `/v1/*` still authenticates against the SHA-256 digest.
+
+Keys created before secrets were stored have no recoverable plaintext. Their Copy button is disabled
+— use **Edit → New secret** to rotate, which issues a new key and invalidates the old one.
+
 ## Notes
 
 - `pm2 save` has been run, so the process is part of the saved PM2 dump.
