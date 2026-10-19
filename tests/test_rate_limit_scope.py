@@ -105,6 +105,19 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         self.assertIn('error',text)
         self.assertEqual(len(self.upstream.calls),1,self.upstream.calls)
 
+    async def test_an_account_scoped_permission_denial_moves_to_another_account(self):
+        self.upstream.fail['uid-intl-a']=(403,{'code':14003,'msg':'permission denied for this account'})
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertEqual([c['headers']['X-User-Id'] for c in self.upstream.calls],['uid-intl-a','uid-intl-b'])
+
+    async def test_a_global_restriction_is_not_replayed(self):
+        for suffix in ('a','b'): self.upstream.fail['uid-intl-'+suffix]=(403,{'code':'risk_control','msg':'human verification required'})
+        status,payload,_=await self.send()
+        self.assertEqual(status,403,payload)
+        self.assertEqual(len(self.upstream.calls),1,self.upstream.calls)
+        self.assertEqual(self.entry('device_verification')['scope'],'global')
+
     async def test_a_client_error_is_not_replayed_on_another_account(self):
         for suffix in ('a','b'): self.upstream.fail['uid-intl-'+suffix]=(400,{'code':11128,'msg':'conversation id missing'})
         status,payload,_=await self.send()

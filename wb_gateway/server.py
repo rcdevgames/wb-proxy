@@ -15,8 +15,14 @@ def _max_failover():
 MAX_FAILOVER=_max_failover()
 # A failure that another account can plausibly absorb. Anything the client caused (bad model,
 # bad parameters, revoked key) is not in here: replaying it would only burn healthy accounts.
-FAILOVER_CODES={'risk_rate_limited','risk_upstream_unavailable','upstream_connection_error','upstream_timeout'}
+FAILOVER_CODES={'upstream_connection_error','upstream_timeout'}
 def failover_allowed(e):
+    # A restriction the gateway classified carries its own scope, and the scope is what decides:
+    # an account-scoped restriction (429, permission denied, quota, login) is another account's
+    # problem to absorb, while a global or region-wide one would follow every candidate, so
+    # replaying it only multiplies the failure.
+    risk=getattr(e,'risk',None) or {}
+    if risk.get('scope'): return risk['scope']=='account'
     if str(getattr(e,'code','')) in FAILOVER_CODES: return True
     status=getattr(e,'status',0)
     return status==429 or (isinstance(status,int) and status>=500)
