@@ -121,6 +121,14 @@ class KeyRecords(unittest.TestCase):
         self.assertEqual(updated['models'], ['gl/x'])
         self.assertEqual(updated['max_concurrency'], 4)
 
+    def test_an_update_can_move_a_key_to_another_region(self):
+        store = self.store()
+        created = store.new_key({'name': 'client', 'scope': 'all'})
+        self.assertEqual(store.update_key(created['id'], {'scope': 'cn'})['scope'], 'cn')
+        with self.assertRaises(Fault):
+            store.update_key(created['id'], {'scope': 'mars'})
+        self.assertEqual(store.update_key(created['id'], {'rpm': 9})['scope'], 'cn')
+
     def test_a_negative_or_non_numeric_limit_is_refused(self):
         store = self.store()
         for body in ({'rpm': -1}, {'max_concurrency': 'lots'}, {'models': 'gl/x'}):

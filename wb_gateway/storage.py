@@ -109,6 +109,8 @@ class Store:
         if 'name' in body:
             name=str(body['name'] or '').strip(); require(0<len(name)<=80,'Key name required'); row['name']=name
         if 'enabled' in body: row['enabled']=bool(body['enabled'])
+        if 'scope' in body:
+            scope=str(body['scope'] or 'all'); require(scope in ('cn','intl','all'),'Invalid scope'); row['scope']=scope
         if 'expires_at' in body: row['expires_at']=body['expires_at'] or None
         row.update(key_limits(body,row))
         if body.get('rotate'):

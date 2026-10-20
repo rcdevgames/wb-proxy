@@ -91,9 +91,10 @@ Behaviour shared by both paths:
 
 ## Per-key limits
 
-Each API key carries three limits, editable in Admin → Keys (create form, and **Edit** on a key card):
+Each API key carries a region and three limits, editable in Admin → Keys (create form, and **Edit** on a key card):
 
-- **Models** — a comma-separated allowlist of region-qualified IDs (`gl/deepseek-v4.1-flash`) or globs (`cn/*`). Empty means every model. `GET /v1/models` returns only what the key may call, and a request outside the list is `403 model_not_allowed` (an ID that does not exist at all stays `404 model_not_found`).
+- **Region** — `cn`, `intl` or `all`. It decides which accounts the key may reach; `all` means every account. Changing it on an existing key takes effect immediately, no need to recreate the key.
+- **Models** — a comma-separated allowlist of region-qualified IDs (`gl/deepseek-v4.1-flash`) or globs (`cn/*`). Empty means every model. The model picker lists only models inside the key's region (`cn/*` for CN, `gl/*` for GL, both for `all`), so a CN key never shows GL models. `GET /v1/models` returns only what the key may call, and a request outside the list is `403 model_not_allowed` (an ID that does not exist at all stays `404 model_not_found`).
 - **Requests / minute** — a sliding 60-second window. Over budget: `429 key_rate_limited` with `Retry-After`.
 - **Max parallel** — in-flight requests for that key. Over budget: `429 key_concurrency_limit` with `Retry-After`. Default is **2**; `0` disables the cap.
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-20 — a Key can change region, and its model picker follows the region
+
+- `POST /admin/keys/{id}` accepts `scope` (`cn`, `intl`, `all`), so a Key no longer has to be
+  recreated to move it to another region. Anything the body does not name stays as it was.
+- The Edit Key dialog gained a Region select; previously only creation could set it.
+- The model picker lists only models the Key's region can serve: `cn` shows `cn/*`, `intl` shows
+  `gl/*`, `all` shows both under CN and GL headings. Saved models that fall outside the chosen
+  region are called out above the list and dropped on Apply.
+- The picker's search box was bound to `click`, so typing never filtered anything; it now listens
+  for `input` and matches case-insensitively.
+
 ## 2026-10-19 — fail over to another account before the first byte
 
 - `generate()` no longer returns a 429 when the account it picked is rate limited. It walks the
