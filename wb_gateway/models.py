@@ -50,6 +50,7 @@ def quote(m,promotions):
     elif base is not None and number(discount.get('factor')): value=float(format(base*discount['factor'],'.12g')); source='modelPromotions.factor'
     badge=(p or {}).get('badge') or {}
     return {'credits_raw':raw,'base_multiplier':base,'effective_multiplier':value,'status':'provided' if value is not None else 'unparsed' if raw else 'not_provided','source':source,'promotion':{'id':p.get('id'),'label':badge.get('label',badge.get('labelEn',badge.get('labelZh'))),'valid_until':p.get('schedule',{}).get('validUntil'),'factor':discount.get('factor'),'discounted_credits':discount.get('discountedCredits')} if p else None}
+ILLEGAL_ACTION='Upstream risk control rejected this request (11140: request illegal). The account cools down briefly and is retried automatically; this is not a permanent permission loss.'
 class Risk:
     def __init__(self,store):
         self.store=store
@@ -59,6 +60,12 @@ class Risk:
             # cannot be acted on: deleting the account is the resolution.
             if e.get('scope')=='account' and e.get('account_id') and not e.get('resolved_at') and e['account_id'] not in store.records:
                 e.update(resolved_at=now(),resolution='account_removed');changed=True
+            if e.get('kind')=='permission_denied' and str(e.get('upstream_code'))=='11140':
+                # 11140 ("request illegal") is WorkBuddy's risk control, not a revoked permission:
+                # the same request succeeds on another account and can succeed on this one minutes
+                # later. Older builds paused it permanently, which emptied the pool until someone
+                # clicked Resume. Reclassify and clear it so a restart restores the accounts.
+                e.update(kind='request_illegal',manual=False,retry_at=0,scope='account',resolved_at=e.get('resolved_at') or now(),resolution=e.get('resolution') or 'transient_reclassified',action=ILLEGAL_ACTION,reclassified_at=now());changed=True
             if e.get('kind')=='channel_not_allowed' and e.get('scope')=='region' and str(e.get('upstream_code'))=='11128':
                 e.update(scope='request',manual=False,retry_at=0,diagnostic_only=True,scope_corrected_at=now());changed=True
             if e.get('kind')=='rate_limited' and e.get('scope')=='region' and e.get('account_id'):
@@ -88,6 +95,7 @@ class Risk:
         code=str(err.get('code','')); msg=str(err.get('message',err.get('msg','')))
         kind=None; scope='account'; manual=True; delay=0; st=status
         if code=='11128' and 'unapproved channel' in msg.lower(): kind='channel_not_allowed'; scope='request'; manual=False; delay=0; st=status if 400<=status<500 else 400
+        elif code=='11140' or 'request illegal' in msg.lower(): kind='request_illegal'; scope='account'; manual=False; delay=60000; st=403
         elif code=='10081': kind='ip_restricted'; scope='global'; st=403
         elif code in ('E0010458','E0010459'): kind='enterprise_quota'; scope='operation'; st=403
         elif re.search('captcha|turing|device.?token|device.?verification|risk.?control|verification.?code|human.?verification|验证码|人机验证|风控',code+' '+msg,re.I): kind='device_verification'; scope='global'; st=403
@@ -104,6 +112,7 @@ class Risk:
         e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+delay,'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now()}
         if kind=='channel_not_allowed':e['action']='Upstream rejected this request (11128: unapproved channel). The cause is not yet identified; no automatic replay, no account switching, and no region-wide block on this basis.'
         if kind=='rate_limited':e['action']='Upstream is rate limiting this account; the region keeps serving from the other accounts during the cooldown.'
+        if kind=='request_illegal':e['action']=ILLEGAL_ACTION
         if old: old.update(e)
         else: self.store.risks.append(e)
         self.save(); return Fault(st,e['action'],'risk_'+kind,e)

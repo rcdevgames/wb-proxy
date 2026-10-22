@@ -113,6 +113,14 @@ rejections are never replayed. Once streaming has started there is nothing to re
 at that point is reported on the open stream. The attempt list is kept on the call row and shown as
 **Failover** in the log detail.
 
+`11140` (`request illegal`) is risk control on the request, not a revoked permission: the same
+request can succeed on another account and the same account can serve again minutes later. It is
+recorded as `request_illegal`, account-scoped, with a 60 s cooldown that doubles on repeats (capped
+at 15 min) and no manual flag, so the account rejoins the pool by itself. Other accounts keep
+serving in the meantime: live traffic shows 200s on healthy accounts in the same seconds another
+one gets 11140, so the rejection is never widened to the region. Rows an older build parked as
+`permission_denied` with upstream code `11140` are reclassified and resolved on load.
+
 ## Copying a key
 
 Each key card shows only `sk-wb-…` (the prefix) so a screenshot of the console cannot leak a working

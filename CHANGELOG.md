@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-22 — 11140 is risk control, not a dead account
+
+- WorkBuddy answers 403 `11140` (`request illegal`) when its risk control rejects a request. It is
+  not a revoked permission: the same request succeeds on another account, and the same account can
+  serve again minutes later. The gateway mapped every 403 to `permission_denied` with a permanent
+  manual pause, so each wave of 11140s took accounts out of the pool until someone clicked Resume —
+  and the shrinking pool produced more 11140s.
+- `11140` now maps to `request_illegal`: account-scoped, 60 s cooldown doubling on repeats (capped
+  at 15 min), `manual: false`, so the account returns on its own.
+- The rejection stays account-scoped: live traffic served 200s on healthy accounts in the same
+  seconds another account got 11140, so widening it to the region would turn a partial rejection
+  into an outage.
+- Rows an older build parked as `permission_denied` with `upstream_code: 11140` are reclassified and
+  resolved on load, so a restart restores the accounts that were stuck behind the old pause.
+- Tests: `test_request_illegal_cools_down_instead_of_waiting_for_a_human`,
+  `test_a_rejected_account_does_not_take_the_region_with_it`,
+  `test_a_permanently_paused_11140_row_is_reclassified_and_cleared`.
+
 ## 2026-10-20 — a Key can change region, and its model picker follows the region
 
 - `POST /admin/keys/{id}` accepts `scope` (`cn`, `intl`, `all`), so a Key no longer has to be

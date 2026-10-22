@@ -171,6 +171,31 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['error_code'],'upstream_11128')
         self.assertEqual(row['upstream_code'],'11128')
 
+    def illegal(self,*suffixes):
+        for suffix in suffixes: self.upstream.fail['uid-intl-'+suffix]=(403,{'code':11140,'msg':'request illegal'})
+
+    async def test_request_illegal_cools_down_instead_of_waiting_for_a_human(self):
+        # 11140 is risk control on one request: the account must come back on its own, not sit
+        # behind a permanent manual pause that only a Resume click can clear.
+        self.illegal('a')
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        entry=self.entry('request_illegal')
+        self.assertEqual(entry['scope'],'account',entry)
+        self.assertFalse(entry['manual'],entry)
+        self.assertGreater(entry['retry_at'],stamp())
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+        entry['retry_at']=stamp()-1
+        self.assertIsNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+
+    async def test_a_rejected_account_does_not_take_the_region_with_it(self):
+        # 11140 is per request, not per region: with one account flagged the other keeps serving.
+        self.illegal('a')
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertEqual(self.entry('request_illegal')['scope'],'account')
+        self.assertIsNone(self.gateway.risk.block('intl','intl_test_b',PATH))
+
 
 class ScopeMigration(unittest.TestCase):
     """A rate limit written with the old region scope is corrected at startup."""
@@ -190,3 +215,11 @@ class ScopeMigration(unittest.TestCase):
         gateway=self.gateway(self.entry(None))
         self.assertEqual(gateway.store.risks[0]['scope'],'region')
         self.assertIsNotNone(gateway.risk.block('intl','intl_y',PATH))
+
+    def test_a_permanently_paused_11140_row_is_reclassified_and_cleared(self):
+        entry=self.entry('intl_x'); entry.update(kind='permission_denied',manual=True,upstream_code='11140')
+        gateway=self.gateway(entry)
+        stored=gateway.store.risks[0]
+        self.assertEqual(stored['kind'],'request_illegal')
+        self.assertFalse(stored['manual'])
+        self.assertIsNone(gateway.risk.block('intl','intl_x',PATH))
