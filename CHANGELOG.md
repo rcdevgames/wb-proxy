@@ -41,8 +41,10 @@
   (`device_verification`, `ip_restricted`, `upstream_unavailable`) is returned immediately because
   it would follow every candidate. Client-caused rejections (unknown model, bad parameter, 11128)
   are never replayed either.
-- Bounded by `WB_MAX_FAILOVER` (default 3, 0 disables). Each attempt is logged in the call row as
-  `failover: [{account_id, status, code, at_ms}]`, and the log detail dialog shows a **Failover** line.
+- Bounded by `WB_MAX_FAILOVER` (default 10, 0 disables), counted as consecutive failures: one
+  success ends the streak and the next request starts from zero. Each attempt is logged in the call
+  row as `failover: [{account_id, status, code, at_ms}]`, and the log detail dialog shows a
+  **Failover** line.
 - Once the response has started streaming there is nothing to replay: a mid-stream failure is still
   reported in-band as an error event on the open stream, never retried.
 - Tests: `test_a_rate_limited_account_is_replaced_before_the_first_byte`,

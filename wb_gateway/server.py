@@ -10,8 +10,8 @@ from .limits import KeyLimits, model_allowed, model_patterns
 from .protocol import validate_chat, prepare, conversation_headers, responses_to_chat, chunks, heartbeat_chunks, Accumulator, ResponsesWriter, contract, read_bounded
 
 def _max_failover():
-    try: return max(0,min(10,int(os.environ.get('WB_MAX_FAILOVER','3'))))
-    except ValueError: return 3
+    try: return max(0,min(10,int(os.environ.get('WB_MAX_FAILOVER','10'))))
+    except ValueError: return 10
 MAX_FAILOVER=_max_failover()
 # A failure that another account can plausibly absorb. Anything the client caused (bad model,
 # bad parameters, revoked key) is not in here: replaying it would only burn healthy accounts.
@@ -417,7 +417,7 @@ class Gateway:
             # failing account is replaced by the next candidate instead of making the caller wait
             # out the cooldown. Once the response has started streaming there is nothing to replay,
             # so those failures are reported in-band (see the except block below).
-            tried=set(); last=None; attempts=0
+            tried=set(); last=None; attempts=0; streak=0
             while True:
                 live=[rm for rm in candidates if rm[0]['id'] not in tried and self.busy.get(rm[0]['id'],0)<8 and rm[0]['id'] not in self.switching and not rm[0].get('needsAccountSync') and not self.risk.block(rm[0]['region'],rm[0]['id'],'/v2/chat/completions')]
                 if not live:
@@ -433,9 +433,13 @@ class Gateway:
                     if unavailable:row['unavailable_server_tools']=unavailable
                     rid=row['id']; headers={'X-Model-ID':chat['model'],'X-Agent-Intent':'craft','X-Agent-Purpose':'conversation','x-codebuddy-request':'1','X-Private-Data':'true',**conversation_headers(chat,req.headers.get('X-Conversation-ID'))}
                     upstream=await self.call(selected['region'],'/v2/chat/completions',selected,'POST',prepare(chat,selected['region']),headers,stream=True)
+                    # The attempt succeeded, so the failover streak is over: a request that fails later
+                    # starts its budget from zero again instead of inheriting this one's attempts.
+                    streak=0; self.risk.served(selected['region'],selected['id'])
                     break
                 except Fault as e:
-                    self.busy[selected['id']]=max(0,self.busy.get(selected['id'],0)-1); busy_acquired=False; attempts+=1
+                    self.busy[selected['id']]=max(0,self.busy.get(selected['id'],0)-1); busy_acquired=False; attempts+=1; streak+=1
+                    row['failover_streak']=streak
                     if not failover_allowed(e) or attempts>=MAX_FAILOVER: raise
                     row.setdefault('failover',[]).append({'account_id':selected['id'],'status':getattr(e,'status',502),'code':getattr(e,'code','upstream_error'),'at_ms':round((time.monotonic()-start)*1000,2)})
                     last=e

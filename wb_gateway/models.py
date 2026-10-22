@@ -90,6 +90,17 @@ class Risk:
     def check(self,region,account,path):
         e=self.block(region,account,path)
         if e: raise Fault(e.get('status',429),e.get('action','Upstream restriction active'),'risk_'+e['kind'],e)
+    def served(self,region,account):
+        # One 200 from an account ends its failure streak: the transient pause is resolved and the
+        # next rejection starts again at the base cooldown instead of a doubled one.
+        changed=False
+        for e in self.store.risks:
+            if e.get('resolved_at') or e.get('manual') or e.get('scope')!='account': continue
+            if e.get('region')!=region or e.get('account_id')!=account: continue
+            if e['kind'] in ('request_illegal','rate_limited','upstream_unavailable'):
+                e.update(resolved_at=now(),resolution='served'); changed=True
+        if changed: self.save()
+        return changed
     def observe(self,status,body,region,account,path,headers=None):
         err=body.get('error') if isinstance(body.get('error'),dict) else body
         code=str(err.get('code','')); msg=str(err.get('message',err.get('msg','')))
@@ -105,7 +116,11 @@ class Risk:
         elif status==403 or code=='403': kind='permission_denied'; st=403
         elif status>=500: kind='upstream_unavailable'; scope='region'; manual=False; delay=5000; st=503
         if not kind: return None
-        old=next((e for e in self.store.risks if self.active(e) and e['kind']==kind and e.get('region')==region and e.get('account_id')==account),None)
+        # Consecutive: a rejection only extends the streak while the account's previous one is recent.
+        # A 200 from that account ends it (see served), so the backoff restarts at the base cooldown
+        # instead of inheriting a doubled one from hours ago.
+        old=next((e for e in reversed(self.store.risks) if e['kind']==kind and e.get('region')==region and e.get('account_id')==account),None)
+        if old and (old.get('resolved_at') or stamp()-old.get('retry_at',0)>=900000): old=None
         count=(old or {}).get('count',0)+1; delay=min(delay*2**min(count-1,10),60000 if kind=='upstream_unavailable' else 900000)
         try: delay=max(delay,float((headers or {}).get('Retry-After',0))*1000)
         except ValueError: pass

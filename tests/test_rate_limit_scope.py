@@ -188,6 +188,55 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         entry['retry_at']=stamp()-1
         self.assertIsNone(self.gateway.risk.block('intl','intl_test_a',PATH))
 
+    def pool(self,size):
+        for i in range(size):
+            self.gateway.store.put({'id':'intl_cap_%02d'%i,'region':'intl','account':{'uid':'uid-cap-%02d'%i,'nickname':'cap%d'%i},'auth':{'accessToken':'token-cap-%02d'%i,'expiresAt':stamp()+3600000}})
+    def limit(self,*indexes):
+        for i in indexes: self.upstream.fail['uid-cap-%02d'%i]=(429,{'code':14003,'msg':'Too many requests, please retry later.'})
+
+    async def test_the_default_cap_still_finds_the_tenth_account(self):
+        # Nine consecutive rejections do not exhaust the budget: the tenth account serves.
+        self.pool(12); self.limit(*range(9))
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertEqual(len(self.upstream.calls),10)
+
+    async def test_the_cap_stops_at_ten_consecutive_failures(self):
+        # Ten rejections in a row are the whole budget, so the eleventh account is left alone.
+        self.pool(12); self.limit(*range(10))
+        status,payload,_=await self.send()
+        self.assertEqual(status,429,payload)
+        self.assertEqual(len(self.upstream.calls),10)
+
+    async def test_one_success_ends_the_account_failure_streak(self):
+        self.illegal('a')
+        status,_,_=await self.send()
+        self.assertEqual(status,200)
+        first=self.entry('request_illegal')
+        self.assertEqual(first['count'],1)
+        # The cooldown expires and the account serves again: that ends its streak.
+        first['retry_at']=stamp()-1; self.gateway.risk.save(); self.upstream.fail.pop('uid-intl-a')
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertIsNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+        self.illegal('a')
+        status,_,_=await self.send()
+        self.assertEqual(status,200)
+        again=[e for e in self.gateway.store.risks if e['kind']=='request_illegal'][-1]
+        self.assertEqual(again['count'],1,again)
+        self.assertLessEqual(again['retry_at']-stamp(),60000)
+
+    async def test_consecutive_rejections_double_the_cooldown(self):
+        # No success in between, so the second rejection is the second one in the streak.
+        self.illegal('a')
+        await self.send()
+        first=self.entry('request_illegal')
+        first['retry_at']=stamp()-1; self.gateway.risk.save()
+        await self.send()
+        again=[e for e in self.gateway.store.risks if e['kind']=='request_illegal'][-1]
+        self.assertEqual(again['count'],2,again)
+        self.assertGreater(again['retry_at']-stamp(),60000)
+
     async def test_a_rejected_account_does_not_take_the_region_with_it(self):
         # 11140 is per request, not per region: with one account flagged the other keeps serving.
         self.illegal('a')
