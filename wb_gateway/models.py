@@ -51,7 +51,14 @@ def quote(m,promotions):
     badge=(p or {}).get('badge') or {}
     return {'credits_raw':raw,'base_multiplier':base,'effective_multiplier':value,'status':'provided' if value is not None else 'unparsed' if raw else 'not_provided','source':source,'promotion':{'id':p.get('id'),'label':badge.get('label',badge.get('labelEn',badge.get('labelZh'))),'valid_until':p.get('schedule',{}).get('validUntil'),'factor':discount.get('factor'),'discounted_credits':discount.get('discountedCredits')} if p else None}
 ILLEGAL_ACTION='Upstream risk control rejected this request (11140: request illegal). The account cools down briefly and is retried automatically; this is not a permanent permission loss.'
-AUX_ACTION='This call went to a metering or profile endpoint, not chat. The rejection is recorded for diagnosis but does not pause the account: chat traffic decides whether it can serve.'
+AUX_ACTION='Rejected on a metering or profile call, not on chat. Only chat traffic can pause an account, so it stays in the pool; this row is diagnostic.'
+# What the operator reads when the call itself fails: short, because it lands in a toast or a table
+# caption, and the row above carries the full explanation.
+def aux_label(path):
+    path=path or ''
+    if path.startswith('/billing/'): return 'metering'
+    if path.startswith('/v3/config'): return 'model catalog'
+    return 'profile'
 LOGIN_ACCESS_ONLY='The upstream no longer accepts this account\'s console session token. It has no refresh path: import a fresh token with Add account → Import accounts from .txt.'
 # Only these paths say anything about whether an account can serve chat. Everything else is a side
 # call (metering, check-in, account sync) that can fail on its own without the account being dead.
@@ -176,8 +183,16 @@ class Risk:
             e['action']=LOGIN_ACCESS_ONLY
         if diagnostic:e['action']=AUX_ACTION
         if diagnostic and kind=='login_required' and record is not None and not (record.get('auth') or {}).get('refreshToken'):
-            e['action']=AUX_ACTION+' If chat is refused the same way, the account\'s console token has been revoked or has expired. '+LOGIN_ACCESS_ONLY
+            e['action']=AUX_ACTION+' If chat is refused the same way, the console token was revoked or expired and cannot be refreshed: import a fresh token with Add account → Import accounts from .txt.'
         if old: old.update(e)
         else: self.store.risks.append(e)
-        self.save(); return Fault(st,e['action'],'risk_'+kind,e)
+        self.save()
+        # The caller gets one line: what failed and whether anything is paused. The row keeps the
+        # explanation, so the console toast is not a paragraph of operator notes.
+        if diagnostic:
+            message='Upstream refused the %s call (HTTP %d). The account is not paused; chat traffic decides.'%(aux_label(path),st)
+            if kind=='login_required' and record is not None and not (record.get('auth') or {}).get('refreshToken'):
+                message+=' If chat is refused too, import a fresh token.'
+            return Fault(st,message,'risk_'+kind,e)
+        return Fault(st,e['action'],'risk_'+kind,e)
     def list(self): return [e for e in self.store.risks if self.active(e)]

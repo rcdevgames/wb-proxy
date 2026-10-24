@@ -608,7 +608,11 @@ async def json_body(req):
     except (ValueError,UnicodeError): raise Fault(400,'Invalid JSON')
     require(isinstance(b,dict),'JSON object required'); return b
 def error_body(e,rid=None):
-    return {'error':{'message':str(e) if isinstance(e,Fault) else 'Request failed','type':getattr(e,'code','proxy_error'),'code':getattr(e,'code','proxy_error'),'param':None,'request_id':rid or uid('req_'),**({'risk':e.risk} if getattr(e,'risk',None) else {})}}
+    # A diagnostic row is not a pause: shipping its operator notes as `risk` would put a paragraph in
+    # the caller's error payload and make the console render notes where it expects an action.
+    risk=getattr(e,'risk',None)
+    if risk and risk.get('diagnostic_only'): risk=None
+    return {'error':{'message':str(e) if isinstance(e,Fault) else 'Request failed','type':getattr(e,'code','proxy_error'),'code':getattr(e,'code','proxy_error'),'param':None,'request_id':rid or uid('req_'),**({'risk':risk} if risk else {})}}
 def create_app(gateway):
     @web.middleware
     async def guard(req,handler):
@@ -623,7 +627,11 @@ def create_app(gateway):
         except Fault as e:
             result=jresponse(anthropic_error(e) if req.path.startswith('/v1/messages') else error_body(e),e.status)
             wait=getattr(e,'retry_after',None)
-            if e.risk: result.headers['Retry-After']=str(max(0,int((e.risk.get('retry_at',stamp())-stamp()+999)//1000)))
+            risk=getattr(e,'risk',None)
+            # A diagnostic row is not a cooldown: telling the caller to back off would invent a limit
+            # the upstream never set.
+            if risk and risk.get('diagnostic_only'): risk=None
+            if risk: result.headers['Retry-After']=str(max(0,int((risk.get('retry_at',stamp())-stamp()+999)//1000)))
             elif wait is not None: result.headers['Retry-After']=str(wait)
         except asyncio.CancelledError: raise
         except Exception: result=jresponse(error_body(Fault(500,'Internal request failure','internal_error')),500)

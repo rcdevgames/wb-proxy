@@ -24,6 +24,12 @@
   cooldowns that expired more than a week ago, are dropped at load (capped at 2000 rows); unresolved
   manual pauses are never dropped. Rows parked on an auxiliary path by the old build are demoted at
   load, which releases the CN accounts on the next restart.
+- The refresh toast used to print the whole operator note ("This call went to a metering or profile
+  endpoint, not chat…") because the fault's message *was* the row's action text. A diagnostic fault now
+  carries a one-line message (`Upstream refused the metering call (HTTP 401). The account is not
+  paused; chat traffic decides.`), ships no `risk` block and no `Retry-After` — it is not a cooldown —
+  and the row keeps the full explanation. The accounts table says "Query failed · account not paused"
+  for such a probe instead of a bare "Query failed".
 - Tests: `test_a_failed_balance_probe_does_not_pause_the_account`,
   `test_the_account_is_still_usable_for_chat_after_the_probe`, `test_a_chat_401_still_pauses_the_account`,
   `test_a_diagnostic_row_never_extends_a_chat_pause`,

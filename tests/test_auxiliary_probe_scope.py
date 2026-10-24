@@ -75,11 +75,27 @@ class AuxiliaryProbe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['scope'],'account')
 
     async def test_an_unparsable_body_is_not_reported_as_an_upstream_code(self):
-        await self.gateway.inspect(self.gateway.store.records[self.rid],'balance')
+        result=await self.gateway.inspect(self.gateway.store.records[self.rid],'balance')
+        error=result['balance']['error']
+        # The caller is told what failed and that nothing is paused; the notes live on the row.
+        self.assertIn('metering',error['message'])
+        self.assertIn('not paused',error['message'])
+        self.assertLess(len(error['message']),180,error['message'])
         row=self.rows('login_required')[-1]
         self.assertIsNone(row['upstream_code'],row)
         self.assertEqual(row.get('upstream_body'),'non-json',row)
-        self.assertIn('metering',row['action'])
+        self.assertIn('diagnostic',row['action'])
+
+    def test_a_diagnostic_error_carries_no_risk_block_and_no_retry_after(self):
+        from wb_gateway.server import error_body
+        entry=self.gateway.risk.observe(401,{'code':401,'msg':'invalid token'},'cn',self.rid,METER,
+                                        record=self.gateway.store.records[self.rid])
+        # A pause in the payload would make the console print operator notes and set a backoff the
+        # upstream never asked for.
+        self.assertNotIn('risk',error_body(entry)['error'])
+        pause=self.gateway.risk.observe(401,{'code':401,'msg':'invalid token'},'cn',self.rid,CHAT,
+                                        record=self.gateway.store.records[self.rid])
+        self.assertIn('risk',error_body(pause)['error'])
 
     async def test_the_account_is_still_usable_for_chat_after_the_probe(self):
         # Not blocked by the probe means chat traffic actually reaches the upstream, which then says
