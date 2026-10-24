@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-10-24 — a failed meter call no longer pauses the account
+
+- The balance sync was answering a 401 on `/billing/meter/get-user-resource-summary` with an
+  account-scoped `login_required` pause, which also blocked `/v2/chat/completions`. A metering
+  endpoint can fail for its own reasons — an edge/WAF page instead of JSON, a throttled background
+  job — and none of that is evidence that the account cannot serve chat. Two CN accounts were
+  parked behind "Login required again" by their own balance probe.
+- Only chat-serving paths (`/v2/chat/completions`, `/v3/config`, `/auth/token/refresh`) can now take
+  an account out of the pool. A rejection from any other path is recorded with
+  `diagnostic_only: true`, `manual: false`, `retry_at: now`: visible in the state file, never in
+  `block()`, and chat traffic decides the account's fate on its own. `ip_restricted` and
+  `request_illegal` keep their full effect from any path: both are verdicts about the account's
+  standing, not about the endpoint being reachable.
+- A diagnostic row never merges with a chat-created pause for the same account, so a later probe
+  cannot silently lift a pause that chat traffic established.
+- An unparsable body (an HTML edge page) is no longer reported as `upstream_code: invalid_upstream`;
+  the status alone classifies it and the row records `upstream_body: non-json`.
+- A 401 on an access-only account (no `refreshToken`) said "resolve the account restriction through
+  official channels", advice that does not exist for a console session token. It now says the token
+  was revoked or expired and to import a fresh one.
+- `risk-state.json` had grown to 635 rows of dead cooldowns. Rows resolved more than a week ago, and
+  cooldowns that expired more than a week ago, are dropped at load (capped at 2000 rows); unresolved
+  manual pauses are never dropped. Rows parked on an auxiliary path by the old build are demoted at
+  load, which releases the CN accounts on the next restart.
+- Tests: `test_a_failed_balance_probe_does_not_pause_the_account`,
+  `test_the_account_is_still_usable_for_chat_after_the_probe`, `test_a_chat_401_still_pauses_the_account`,
+  `test_a_diagnostic_row_never_extends_a_chat_pause`,
+  `test_a_revoked_console_token_says_to_import_a_fresh_one`,
+  `test_an_unparsable_body_is_not_reported_as_an_upstream_code`,
+  `test_a_metering_pause_is_lifted_at_startup`, `test_dead_cooldowns_are_dropped_and_live_pauses_kept`.
+
 ## 2026-10-22 — 11140 is risk control, not a dead account
 
 - WorkBuddy answers 403 `11140` (`request illegal`) when its risk control rejects a request. It is

@@ -117,7 +117,7 @@ class Gateway:
                 bad=not 200<=response.status<300 or data.get('error') or data.get('code') not in (None,0,200,'0','200')
                 if bad:
                     if str(data.get('code')) in ('11217','12151') and ('/auth/token?' in path or '/login/account?' in path): return data
-                    guarded=self.risk.observe(response.status,data,region,(record or {}).get('id'),path,response.headers)
+                    guarded=self.risk.observe(response.status,data,region,(record or {}).get('id'),path,response.headers,record)
                     if guarded: raise guarded
                     details=data.get('error') if isinstance(data.get('error'),dict) else data
                     message=str(details.get('message',details.get('msg','Official API rejected request')))

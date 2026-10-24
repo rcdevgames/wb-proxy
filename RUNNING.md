@@ -86,6 +86,9 @@ Behaviour shared by both paths:
 - The token is verified against upstream (`/v2/plugin/accounts`) before it is stored, so the account is usable immediately.
 - Re-importing is safe: accounts are matched on `uid` + `enterpriseId` and updated in place instead of duplicated. A `login_required` pause on the account is cleared by the import.
 - A pause that names an account which is no longer in the store blocks nothing and cannot be acted on, so it is resolved automatically (`resolution: account_removed`) at startup instead of sitting in the console as a manual action.
+- Only chat-serving paths can pause an account. A 401 from the balance probe (`/billing/meter/...`) or a profile sync is recorded as `diagnostic_only` and leaves the account in the pool — those endpoints also answer 401 behind an edge page or a throttle — so a balance refresh never takes a working account offline. The failed probe still shows in the row ("Query failed") and in the sync toast.
+- A console session token has no refresh path: when chat answers 401 for an access-only account, the pause text says to import a fresh token rather than to resolve it through official channels.
+- `risk-state.json` is compacted at startup: rows resolved more than a week ago and cooldowns that expired more than a week ago are dropped (2000-row cap). Unresolved manual pauses are never dropped.
 - The line's `name` is kept as the account label and shown as the row subtitle in the console (the upstream nickname remains the account title).
 - Token values are never returned: the UI shows only per-line status and, on failure, an error code/message with the token redacted. Limits: 2 MB of text and 50 lines per import.
 

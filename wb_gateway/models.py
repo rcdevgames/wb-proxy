@@ -51,6 +51,14 @@ def quote(m,promotions):
     badge=(p or {}).get('badge') or {}
     return {'credits_raw':raw,'base_multiplier':base,'effective_multiplier':value,'status':'provided' if value is not None else 'unparsed' if raw else 'not_provided','source':source,'promotion':{'id':p.get('id'),'label':badge.get('label',badge.get('labelEn',badge.get('labelZh'))),'valid_until':p.get('schedule',{}).get('validUntil'),'factor':discount.get('factor'),'discounted_credits':discount.get('discountedCredits')} if p else None}
 ILLEGAL_ACTION='Upstream risk control rejected this request (11140: request illegal). The account cools down briefly and is retried automatically; this is not a permanent permission loss.'
+AUX_ACTION='This call went to a metering or profile endpoint, not chat. The rejection is recorded for diagnosis but does not pause the account: chat traffic decides whether it can serve.'
+LOGIN_ACCESS_ONLY='The upstream no longer accepts this account\'s console session token. It has no refresh path: import a fresh token with Add account → Import accounts from .txt.'
+# Only these paths say anything about whether an account can serve chat. Everything else is a side
+# call (metering, check-in, account sync) that can fail on its own without the account being dead.
+def pool_critical(path): return '/chat/' in (path or '') or path.startswith('/v3/config') or '/auth/token/refresh' in path
+# Rows nobody can act on any more are dropped at load; this caps the file after that.
+MAX_RISK_ROWS=2000
+
 class Risk:
     def __init__(self,store):
         self.store=store
@@ -70,11 +78,31 @@ class Risk:
                 e.update(scope='request',manual=False,retry_at=0,diagnostic_only=True,scope_corrected_at=now());changed=True
             if e.get('kind')=='rate_limited' and e.get('scope')=='region' and e.get('account_id'):
                 e.update(scope='account',scope_corrected_at=now());changed=True
+            if e.get('kind')=='login_required' and not e.get('resolved_at') and not pool_critical(e.get('path')):
+                # An older build paused the whole account because a metering call answered 401, which
+                # is also what an edge page, a throttled job and an expired token look like. Nothing
+                # about that proves the account cannot serve chat: drop the pause and let the next
+                # chat request decide.
+                e.update(manual=False,retry_at=stamp(),diagnostic_only=True,scope='account',action=AUX_ACTION,demoted_at=now());changed=True
         if changed:self.save()
+        if self.prune(): self.save()
+    def prune(self):
+        # The file accumulated thousands of dead rows: cooldowns that expired days ago and pauses
+        # resolved weeks ago. Anything a human can still act on (manual, unresolved) is kept.
+        cutoff=stamp()-7*86400*1000
+        def stale(e):
+            if e.get('resolved_at'):
+                try: return stamp()-datetime.fromisoformat(e['resolved_at'].replace('Z','+00:00')).timestamp()*1000>7*86400*1000
+                except (ValueError,TypeError): return False
+            return not e.get('manual') and e.get('retry_at',0)<cutoff
+        keep=[e for e in self.store.risks if not stale(e)]
+        if len(keep)>MAX_RISK_ROWS: keep=keep[-MAX_RISK_ROWS:]
+        if len(keep)==len(self.store.risks): return False
+        self.store.risks=keep; return True
     def save(self): atomic(self.store.root/'risk-state.json',{'version':1,'entries':self.store.risks})
     def active(self,e): return not e.get('resolved_at') and (e.get('manual') or e.get('retry_at',0)>stamp())
     def matches(self,e,region,account,path):
-        if e.get('scope')=='request': return False
+        if e.get('scope')=='request' or e.get('diagnostic_only'): return False
         if e.get('kind')=='quota_exhausted' and '/chat/' not in path and not path.endswith('/daily-checkin'): return False
         if e.get('kind')=='login_required' and not account and '/auth/' in path and '/refresh' not in path: return False
         if e['scope']=='global': return True
@@ -101,9 +129,14 @@ class Risk:
                 e.update(resolved_at=now(),resolution='served'); changed=True
         if changed: self.save()
         return changed
-    def observe(self,status,body,region,account,path,headers=None):
+    def observe(self,status,body,region,account,path,headers=None,record=None):
         err=body.get('error') if isinstance(body.get('error'),dict) else body
         code=str(err.get('code','')); msg=str(err.get('message',err.get('msg','')))
+        # A body the gateway could not parse (an edge page instead of JSON) carries no upstream code:
+        # classify on the status alone and say the body was not JSON, instead of storing the gateway's
+        # own parse error as if the upstream had sent that code.
+        unparsed=code=='invalid_upstream'
+        if unparsed: code=''; msg=''
         kind=None; scope='account'; manual=True; delay=0; st=status
         if code=='11128' and 'unapproved channel' in msg.lower(): kind='channel_not_allowed'; scope='request'; manual=False; delay=0; st=status if 400<=status<500 else 400
         elif code=='11140' or 'request illegal' in msg.lower(): kind='request_illegal'; scope='account'; manual=False; delay=60000; st=403
@@ -116,18 +149,34 @@ class Risk:
         elif status==403 or code=='403': kind='permission_denied'; st=403
         elif status>=500: kind='upstream_unavailable'; scope='region'; manual=False; delay=5000; st=503
         if not kind: return None
+        # A side call failing is not evidence that the account cannot serve chat: a WAF page, a
+        # throttled background job and a revoked token all look alike on a metering endpoint. Keep the
+        # row for diagnosis, but leave the account in the pool and let chat traffic decide its fate.
+        # An IP ban and a risk-control verdict are about the account's standing, not the endpoint being
+        # reachable, so they keep their full effect wherever they arrive.
+        diagnostic=kind not in ('ip_restricted','request_illegal') and not pool_critical(path)
+        if diagnostic:
+            if scope!='request': scope='account'
+            manual=False; delay=0
         # Consecutive: a rejection only extends the streak while the account's previous one is recent.
         # A 200 from that account ends it (see served), so the backoff restarts at the base cooldown
         # instead of inheriting a doubled one from hours ago.
-        old=next((e for e in reversed(self.store.risks) if e['kind']==kind and e.get('region')==region and e.get('account_id')==account),None)
+        old=next((e for e in reversed(self.store.risks) if e['kind']==kind and e.get('region')==region and e.get('account_id')==account and bool(e.get('diagnostic_only'))==diagnostic),None)
         if old and (old.get('resolved_at') or stamp()-old.get('retry_at',0)>=900000): old=None
         count=(old or {}).get('count',0)+1; delay=min(delay*2**min(count-1,10),60000 if kind=='upstream_unavailable' else 900000)
         try: delay=max(delay,float((headers or {}).get('Retry-After',0))*1000)
         except ValueError: pass
-        e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+delay,'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now()}
+        e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+(0 if diagnostic else delay),'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code or None,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now(),**({'diagnostic_only':True} if diagnostic else {}),**({'upstream_body':'non-json'} if unparsed else {})}
         if kind=='channel_not_allowed':e['action']='Upstream rejected this request (11128: unapproved channel). The cause is not yet identified; no automatic replay, no account switching, and no region-wide block on this basis.'
         if kind=='rate_limited':e['action']='Upstream is rate limiting this account; the region keeps serving from the other accounts during the cooldown.'
         if kind=='request_illegal':e['action']=ILLEGAL_ACTION
+        if kind=='login_required' and not diagnostic and record is not None and not (record.get('auth') or {}).get('refreshToken'):
+            # An access-only import cannot be refreshed, so "resolve it officially" points the operator
+            # at a path that does not exist for this account.
+            e['action']=LOGIN_ACCESS_ONLY
+        if diagnostic:e['action']=AUX_ACTION
+        if diagnostic and kind=='login_required' and record is not None and not (record.get('auth') or {}).get('refreshToken'):
+            e['action']=AUX_ACTION+' If chat is refused the same way, the account\'s console token has been revoked or has expired. '+LOGIN_ACCESS_ONLY
         if old: old.update(e)
         else: self.store.risks.append(e)
         self.save(); return Fault(st,e['action'],'risk_'+kind,e)
