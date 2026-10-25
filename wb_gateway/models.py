@@ -50,7 +50,18 @@ def quote(m,promotions):
     elif base is not None and number(discount.get('factor')): value=float(format(base*discount['factor'],'.12g')); source='modelPromotions.factor'
     badge=(p or {}).get('badge') or {}
     return {'credits_raw':raw,'base_multiplier':base,'effective_multiplier':value,'status':'provided' if value is not None else 'unparsed' if raw else 'not_provided','source':source,'promotion':{'id':p.get('id'),'label':badge.get('label',badge.get('labelEn',badge.get('labelZh'))),'valid_until':p.get('schedule',{}).get('validUntil'),'factor':discount.get('factor'),'discounted_credits':discount.get('discountedCredits')} if p else None}
-ILLEGAL_ACTION='Upstream risk control rejected this request (11140: request illegal). The account cools down briefly and is retried automatically; this is not a permanent permission loss.'
+# 11140's own wording is "your account has been restricted due to unusual activity ... submit
+# feedback to appeal": the vendor's verdict on the account, not on the request. It is not lifted by
+# waiting a minute, and every retry is another abnormal-activity datapoint on the same egress IP, so
+# the first verdict rests the account for half an hour and a repeat inside the window parks it until
+# the operator appeals and resumes.
+RESTRICTED_FIRST=30*60*1000
+RESTRICTED_REPEAT=2*60*60*1000
+# How long a repeat verdict still counts as the same streak. The cooldown is half an hour, so the
+# generic fifteen-minute window would always look like a fresh start and the escalation never fire.
+RESTRICTED_WINDOW=12*60*60*1000
+RESTRICTED_ACTION='Upstream restricted this account (11140: unusual activity). Rested for 30 minutes; a repeat verdict parks it until the restriction is lifted. Appeal in WorkBuddy: Submit feedback.'
+RESTRICTED_APPEAL='Upstream restricted this account again (11140: unusual activity). It stays out of the pool until WorkBuddy lifts the restriction: appeal with WorkBuddy → Submit feedback, then Resume this account.'
 AUX_ACTION='Rejected on a metering or profile call, not on chat. Only chat traffic can pause an account, so it stays in the pool; this row is diagnostic.'
 # What the operator reads when the call itself fails: short, because it lands in a toast or a table
 # caption, and the row above carries the full explanation.
@@ -75,12 +86,18 @@ class Risk:
             # cannot be acted on: deleting the account is the resolution.
             if e.get('scope')=='account' and e.get('account_id') and not e.get('resolved_at') and e['account_id'] not in store.records:
                 e.update(resolved_at=now(),resolution='account_removed');changed=True
+            if e.get('kind')=='request_illegal' and not e.get('resolved_at'):
+                # The previous build read 11140 as "risk control on this request" and rested the
+                # account for a minute, doubling to fifteen. The vendor's own text says the account
+                # is restricted until an appeal is granted, so the old row understates it and kept
+                # retrying. Carry it over to the current reading: a longer rest, and the appeal named
+                # as the way back.
+                e.update(kind='account_restricted',manual=False,scope='account',action=RESTRICTED_ACTION,reclassified_at=now());changed=True
             if e.get('kind')=='permission_denied' and str(e.get('upstream_code'))=='11140':
-                # 11140 ("request illegal") is WorkBuddy's risk control, not a revoked permission:
-                # the same request succeeds on another account and can succeed on this one minutes
-                # later. Older builds paused it permanently, which emptied the pool until someone
-                # clicked Resume. Reclassify and clear it so a restart restores the accounts.
-                e.update(kind='request_illegal',manual=False,retry_at=0,scope='account',resolved_at=e.get('resolved_at') or now(),resolution=e.get('resolution') or 'transient_reclassified',action=ILLEGAL_ACTION,reclassified_at=now());changed=True
+                # Older builds paused it permanently, which emptied the pool until someone clicked
+                # Resume. 11140 is the vendor's account verdict, so it rests for a while and returns
+                # by itself unless the verdict repeats.
+                e.update(kind='account_restricted',manual=False,scope='account',retry_at=stamp()+RESTRICTED_FIRST,resolved_at=None,resolution=None,action=RESTRICTED_ACTION,reclassified_at=now());changed=True
             if e.get('kind')=='channel_not_allowed' and e.get('scope')=='region' and str(e.get('upstream_code'))=='11128':
                 e.update(scope='request',manual=False,retry_at=0,diagnostic_only=True,scope_corrected_at=now());changed=True
             if e.get('kind')=='rate_limited' and e.get('scope')=='region' and e.get('account_id'):
@@ -132,7 +149,9 @@ class Risk:
         for e in self.store.risks:
             if e.get('resolved_at') or e.get('manual') or e.get('scope')!='account': continue
             if e.get('region')!=region or e.get('account_id')!=account: continue
-            if e['kind'] in ('request_illegal','rate_limited','upstream_unavailable'):
+            if e['kind'] in ('account_restricted','rate_limited','upstream_unavailable'):
+                # A manual restriction is excluded above: only an operator clears that one, because a
+                # 200 in between does not mean the vendor lifted an account-wide verdict.
                 e.update(resolved_at=now(),resolution='served'); changed=True
         if changed: self.save()
         return changed
@@ -146,7 +165,7 @@ class Risk:
         if unparsed: code=''; msg=''
         kind=None; scope='account'; manual=True; delay=0; st=status
         if code=='11128' and 'unapproved channel' in msg.lower(): kind='channel_not_allowed'; scope='request'; manual=False; delay=0; st=status if 400<=status<500 else 400
-        elif code=='11140' or 'request illegal' in msg.lower(): kind='request_illegal'; scope='account'; manual=False; delay=60000; st=403
+        elif code=='11140' or 'account has been restricted' in msg.lower() or '账号存在异常' in msg: kind='account_restricted'; scope='account'; manual=False; delay=RESTRICTED_FIRST; st=403
         elif code=='10081': kind='ip_restricted'; scope='global'; st=403
         elif code in ('E0010458','E0010459'): kind='enterprise_quota'; scope='operation'; st=403
         elif re.search('captcha|turing|device.?token|device.?verification|risk.?control|verification.?code|human.?verification|验证码|人机验证|风控',code+' '+msg,re.I): kind='device_verification'; scope='global'; st=403
@@ -161,7 +180,7 @@ class Risk:
         # row for diagnosis, but leave the account in the pool and let chat traffic decide its fate.
         # An IP ban and a risk-control verdict are about the account's standing, not the endpoint being
         # reachable, so they keep their full effect wherever they arrive.
-        diagnostic=kind not in ('ip_restricted','request_illegal') and not pool_critical(path)
+        diagnostic=kind not in ('ip_restricted','account_restricted') and not pool_critical(path)
         if diagnostic:
             if scope!='request': scope='account'
             manual=False; delay=0
@@ -169,14 +188,23 @@ class Risk:
         # A 200 from that account ends it (see served), so the backoff restarts at the base cooldown
         # instead of inheriting a doubled one from hours ago.
         old=next((e for e in reversed(self.store.risks) if e['kind']==kind and e.get('region')==region and e.get('account_id')==account and bool(e.get('diagnostic_only'))==diagnostic),None)
-        if old and (old.get('resolved_at') or stamp()-old.get('retry_at',0)>=900000): old=None
-        count=(old or {}).get('count',0)+1; delay=min(delay*2**min(count-1,10),60000 if kind=='upstream_unavailable' else 900000)
+        window=RESTRICTED_WINDOW if kind=='account_restricted' else 900000
+        if old and (old.get('resolved_at') or stamp()-old.get('retry_at',0)>=window): old=None
+        count=(old or {}).get('count',0)+1
+        if kind=='account_restricted':
+            # Half an hour on the first verdict; from the second one on the account is parked until a
+            # human appeals, because retrying a restriction the vendor says is account-wide only feeds
+            # the unusual-activity signal that caused it.
+            delay=RESTRICTED_FIRST if count<2 else RESTRICTED_REPEAT
+            if count>=2: manual=True
+        else:
+            delay=min(delay*2**min(count-1,10),60000 if kind=='upstream_unavailable' else 900000)
         try: delay=max(delay,float((headers or {}).get('Retry-After',0))*1000)
         except ValueError: pass
         e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+(0 if diagnostic else delay),'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code or None,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now(),**({'diagnostic_only':True} if diagnostic else {}),**({'upstream_body':'non-json'} if unparsed else {})}
         if kind=='channel_not_allowed':e['action']='Upstream rejected this request (11128: unapproved channel). The cause is not yet identified; no automatic replay, no account switching, and no region-wide block on this basis.'
         if kind=='rate_limited':e['action']='Upstream is rate limiting this account; the region keeps serving from the other accounts during the cooldown.'
-        if kind=='request_illegal':e['action']=ILLEGAL_ACTION
+        if kind=='account_restricted':e['action']=RESTRICTED_APPEAL if manual else RESTRICTED_ACTION
         if kind=='login_required' and not diagnostic and record is not None and not (record.get('auth') or {}).get('refreshToken'):
             # An access-only import cannot be refreshed, so "resolve it officially" points the operator
             # at a path that does not exist for this account.

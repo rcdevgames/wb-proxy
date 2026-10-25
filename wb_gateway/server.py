@@ -26,6 +26,12 @@ def failover_allowed(e):
     if str(getattr(e,'code','')) in FAILOVER_CODES: return True
     status=getattr(e,'status',0)
     return status==429 or (isinstance(status,int) and status>=500)
+# An account-wide risk verdict is worth a second opinion on another account, because it does land per
+# account: live traffic served 200s on accounts imported later from the same egress IP while the older
+# batch answered 11140. So 11140 stays in the failover set and the walk continues to a healthy account.
+# What made it expensive was the cooldown, not the walk: a restricted account now rests 30 minutes, so
+# a request cannot collect the same 403 from every account more than once per rest.
+def risk_kind(e): return str(getattr(e,'code','')).removeprefix('risk_')
 def network_proxy():
     mode=os.environ.get('WB_PROXY_MODE','auto')
     if mode=='direct': return None,'direct'
@@ -161,7 +167,7 @@ class Gateway:
         scope=internal_region(scope); region=internal_region(region)
         require(region in (None,'','cn','intl'),'Invalid region')
         require(scope=='all' or not region or scope==region,'API key does not permit region',403,'scope_denied')
-        return [r for r in self.store.records.values() if (scope=='all' or r['region']==scope) and (not region or r['region']==region) and (not account or r['id']==account)]
+        return [r for r in self.store.records.values() if (scope=='all' or r['region']==scope) and (not region or r['region']==region) and (not account or r['id']==account) and r.get('enabled',True)]
     async def catalogs_for(self,scope,region=None,account=None):
         rows=self.accounts(scope,region,account); require(rows,'No accounts in key scope',503,'no_accounts')
         for r in rows:
@@ -330,6 +336,8 @@ class Gateway:
                 if e['kind']=='login_required' and e.get('account_id')==r['id']: e['resolved_at']=now()
             self.risk.save(); p['result']={'status':'complete','account_id':r['id'],'region':region,'account':account}; p.pop('state',None); p.pop('auth',None); return p['result']
     async def bulk(self,b):
+        # Enable/disable share the selection endpoint with refresh/check-in but finish immediately.
+        if b.get('action') in ('enable','disable'): return self.bulk_toggle(b)
         require(b.get('action') in ('refresh','checkin'),'Unknown bulk action'); require(b.get('region') in (None,'cn','intl'),'Invalid region')
         if self.active_job:
             require(all(self.active_job.get(k)==b.get(k) for k in ('action','region','account_ids')),'Another bulk job running',409); return self.active_job
@@ -348,6 +356,25 @@ class Gateway:
                 job['status']='completed'
             finally: self.active_job=None
         self.task(work()); return job
+    def bulk_toggle(self,b):
+        # Toggle jobs finish inline because they only change local account flags.
+        action=b.get('action'); require(action in ('enable','disable'),'Unknown bulk action'); require(b.get('region') in (None,'cn','intl'),'Invalid region')
+        ids=b.get('account_ids')
+        if ids is not None: require(isinstance(ids,list) and 0<len(ids)<=500 and all(i in self.store.records for i in ids),'Invalid selected accounts')
+        region=internal_region(b.get('region'))
+        rows=[r for r in self.store.records.values() if (not region or r['region']==region) and (ids is None or r['id'] in ids)]
+        results=[]; changed=False
+        for r in rows:
+            if action=='enable':
+                if r.get('enabled') is False: r.pop('enabled',None); changed=True
+                results.append({'account_id':r['id'],'status':'enabled'})
+            elif self.busy.get(r['id']):
+                results.append({'account_id':r['id'],'status':'skipped','error':{'code':'account_busy','message':'Account is serving a request'}})
+            else:
+                r['enabled']=False; changed=True; results.append({'account_id':r['id'],'status':'disabled'})
+        if changed: self.store.save()
+        counted={name:sum(1 for x in results if x['status']==name) for name in ('enabled','disabled','skipped')}
+        return {'action':action,'status':'completed','total':len(rows),**counted,'results':results}
     def log_query(self,q):
         try: page=max(1,min(100000,int(q.get('page',1)))); limit=max(1,min(100,int(q.get('limit',25))))
         except ValueError: raise Fault(400,'Invalid pagination')
@@ -558,8 +585,15 @@ class Gateway:
                 if action in ('model-settings','request-preview'): raise Fault(410,'Model settings belong to the client','client_parameters_required')
                 if action is None and method=='DELETE':
                     require(not self.busy.get(r['id']) and r['id'] not in self.refresh_tasks and r['id'] not in self.switching,'Account busy',409); self.store.records.pop(r['id']); self.store.save(); self.catalogs.pop(r['id'],None); return jresponse({'removed':True,'upstream_revoked':False})
-                if action in ('inspect','balance','checkin') and method=='POST': return jresponse(await self.inspect(r,action))
-                if action=='refresh' and method=='POST': require(r['id'] not in self.switching,'Account switching',409); return jresponse(self.store.public(await self.refresh(r,True)))
+                if action in ('inspect','balance','checkin') and method=='POST':
+                    # Disabled accounts cannot trigger balance, check-in, or token refresh calls.
+                    require(r.get('enabled',True),'Account is disabled; enable it first',409,'account_disabled'); return jresponse(await self.inspect(r,action))
+                if action=='enable' and method=='POST':
+                    # Disabling keeps the encrypted tokens while removing the account from traffic.
+                    r.pop('enabled',None); self.store.put(r); return jresponse(self.store.public(r))
+                if action=='disable' and method=='POST':
+                    require(not self.busy.get(r['id']),'Account busy',409); r['enabled']=False; self.store.put(r); return jresponse(self.store.public(r))
+                if action=='refresh' and method=='POST': require(r.get('enabled',True),'Account is disabled; enable it first',409,'account_disabled'); require(r['id'] not in self.switching,'Account switching',409); return jresponse(self.store.public(await self.refresh(r,True)))
                 if action=='config' and method=='GET': return jresponse(await self.call(r['region'],'/v3/config',await self.refresh(r)))
                 if action=='management' and method=='GET': return jresponse(r.get('management',{}))
                 if action=='switch' and method=='POST':

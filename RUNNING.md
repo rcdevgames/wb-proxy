@@ -66,7 +66,7 @@ Changing `args`, `interpreter` or `env` requires `pm2 delete wb-gateway` followe
 
 The console exports one `name|token` pair per line (Keycloak offline token). Two ways in:
 
-**1. Console UI (no restart):** Account page → *Add account* → *Import accounts from .txt*. Choose a `.txt` file or paste the lines, then *Import*. The endpoint is `POST /admin/accounts/import` with `{"text": "<lines>"}`; it answers `201` with `{imported, updated, failed, total, account_ids, results[]}` where each result carries `line`, `name`, `status`, `account_id`, `region`, `nickname` and, on failure, `error.code` / `error.message`. After a successful import the UI refreshes the dashboard and runs a balance sync for the imported accounts.
+**1. Console UI (no restart):** Account page → *Add account* → *Import accounts from .txt*. Choose a `.txt` file or paste the lines, then *Import*. The endpoint is `POST /admin/accounts/import` with `{"text": "<lines>"}`; it answers `201` with `{imported, updated, failed, total, account_ids, results[]}` where each result carries `line`, `name`, `status`, `account_id`, `region`, `nickname` and, on failure, `error.code` / `error.message`. Import only saves the accounts; balance queries are manual via the row, selected, or page **Refresh** controls.
 
 **2. Helper script (service stopped):**
 
@@ -118,13 +118,34 @@ rejections are never replayed. Once streaming has started there is nothing to re
 at that point is reported on the open stream. The attempt list is kept on the call row and shown as
 **Failover** in the log detail.
 
-`11140` (`request illegal`) is risk control on the request, not a revoked permission: the same
-request can succeed on another account and the same account can serve again minutes later. It is
-recorded as `request_illegal`, account-scoped, with a 60 s cooldown that doubles on repeats (capped
-at 15 min) and no manual flag, so the account rejoins the pool by itself. Other accounts keep
-serving in the meantime: live traffic shows 200s on healthy accounts in the same seconds another
-one gets 11140, so the rejection is never widened to the region. Rows an older build parked as
-`permission_denied` with upstream code `11140` are reclassified and resolved on load.
+`11140` (`request illegal`) is the vendor's verdict on the account, not on the request: the same
+account answers `403 {"code":11140,"displayMsg":"Your account has been restricted due to unusual
+activity"}` while `/billing/meter/*`, `/v3/config` and `/v2/plugin/account` keep answering 200 with the
+same token. It is recorded as `account_restricted`, account-scoped, `manual: false`, rested for 30
+minutes; a second verdict inside 12 hours parks the account (`manual: true`, 2 h) until the operator
+appeals in WorkBuddy → Submit feedback and clicks Resume. A 200 never clears a manual row.
+
+Failover keeps walking on it, because the verdict lands per account: accounts imported later served
+200s from the same egress while the older batch answered 11140. What makes the walk cheap is the
+30-minute rest, not an attempt cap — once every account is restricted the next request is refused
+locally instead of walking the pool again. Other accounts keep serving meanwhile, so the rejection is
+never widened to the region. Rows an older build wrote as `request_illegal` or as `permission_denied`
+with code `11140` are reclassified on load.
+
+Live evidence from 2026-10-25: 15 accounts imported in one batch all answered 11140 while 5 accounts
+imported later answered 200 from the same egress IP, so the verdict is per account and never an IP ban.
+
+## Disabling an account
+
+Each row on the Accounts page has **Disable** (and **Enable** once it is off); selected rows can also be toggled together. A disabled account
+stays in `data/accounts.enc.json` with its tokens intact but leaves the pool: `accounts()` filters it
+out, so it is skipped by chat routing, model listing, balance sync and check-in jobs. Balance refresh
+is manual for every account; imports, sign-ins, and opening account details do not query it. Refresh
+controls also exclude disabled accounts. Nothing is sent upstream while an account is off, which is
+what an operator wants for an account the vendor restricted — no traffic to re-flag it, and no
+re-import when the appeal goes through. `POST /admin/accounts/{id}/disable` and `POST
+/admin/accounts/{id}/enable` back the buttons; disable refuses with `409` while the account is in
+flight.
 
 ## Copying a key
 

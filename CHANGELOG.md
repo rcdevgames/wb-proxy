@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-10-25 — 11140 is an account restriction, so rest it like one
+
+- WorkBuddy's 403 `11140` says `Your account has been restricted due to unusual activity … submit
+  feedback to appeal`. The previous build read it as risk control on a single request and rested the
+  account for 60 s, doubling to 15 min, so a fully restricted pool retried every account every
+  quarter hour and called the verdict transient in the console.
+- `11140` now maps to `account_restricted`: account-scoped, 30-minute rest on the first verdict, and
+  from the second verdict inside 12 hours the account is parked (`manual: true`, 2 h) until the
+  operator appeals in WorkBuddy → Submit feedback and resumes it. `served()` never clears a manual
+  row, because a stray 200 does not mean the vendor lifted an account-wide verdict.
+- A bare `11128` body is no longer misread as 11140. Both answer `msg: "request illegal"`, and the old
+  `'request illegal' in msg` rule turned a per-request channel refusal answered `400` into an account
+  pause (observed live: `upstream_code: 11128` stored with kind `request_illegal`). Classification is
+  now code-driven, and the only message fallback left is the vendor's account-restriction sentence.
+  A plain `11128` stays an unclassified per-request rejection, as documented before.
+- Failover keeps walking on `account_restricted`, because the verdict lands per account and the accounts
+  imported later served 200 from the same egress. The walk is made cheap by the 30-minute rest instead
+  of by an attempt cap: a fully restricted pool is refused locally on the next request, verified by
+  `test_a_restricted_account_is_skipped_by_later_requests` (8 calls then 0).
+- Each account row now has **Disable** / **Enable**. A disabled account keeps its tokens and its record
+  but leaves the pool entirely — chat routing, model listing, balance sync and check-in jobs all skip
+  it — so an operator can park a restricted account without deleting it and re-importing later.
+- Tests: `test_a_disabled_account_leaves_the_pool_and_keeps_its_record`,
+  `test_enable_puts_it_back_in_the_pool`, `test_a_disabled_account_is_not_swept_by_a_bulk_job`.
+- Live finding behind the change: 15 accounts imported in one batch all answered 11140 on chat while
+  `/billing/meter/get-user-resource-summary`, `/v3/config`, `/v2/plugin/account` and token refresh
+  kept answering 200 with the same tokens; 5 accounts imported afterwards answered 200 from the same
+  egress IP. The restriction is per account, not an IP ban and not a dead token.
+- Old rows are migrated on load: `permission_denied` + `11140` and unresolved `request_illegal` rows
+  become `account_restricted` and name the appeal.
+- Tests: `test_a_restricted_account_rests_and_the_next_one_serves`,
+  `test_a_repeat_restriction_parks_the_account_until_an_appeal`,
+  `test_a_second_restriction_in_one_request_stops_the_walk`,
+  `test_one_restriction_still_fails_over_to_a_healthy_account`,
+  `test_an_old_request_illegal_row_is_carried_over_to_the_longer_rest`.
+
 ## 2026-10-24 — a failed meter call no longer pauses the account
 
 - The balance sync was answering a 401 on `/billing/meter/get-user-resource-summary` with an

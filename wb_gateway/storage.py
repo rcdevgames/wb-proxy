@@ -77,7 +77,7 @@ class Store:
         encrypted=AESGCM(self.key).encrypt(iv,raw,b'workbuddy-proxy-v1')
         atomic(self.root/'accounts.enc.json',{'version':1,'iv':base64.b64encode(iv).decode(),'tag':base64.b64encode(encrypted[-16:]).decode(),'data':base64.b64encode(encrypted[:-16]).decode()})
     def put(self,record): self.records[record['id']]=record; self.save()
-    def public(self,r): return {'id':r['id'],'region':r['region'],'account':r.get('account',{}),'expires_at':r.get('auth',{}).get('expiresAt'),'refreshable':bool(r.get('auth',{}).get('refreshToken')),'label':r.get('import_label')}
+    def public(self,r): return {'id':r['id'],'region':r['region'],'account':r.get('account',{}),'expires_at':r.get('auth',{}).get('expiresAt'),'refreshable':bool(r.get('auth',{}).get('refreshToken')),'label':r.get('import_label'),'enabled':r.get('enabled',True)}
     def save_keys(self): atomic(self.root/'api-keys.json',{'version':1,'keys':self.keys})
     def seal(self,secret):
         iv=secrets.token_bytes(12)

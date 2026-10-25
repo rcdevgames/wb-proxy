@@ -172,18 +172,19 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['upstream_code'],'11128')
 
     def illegal(self,*suffixes):
-        for suffix in suffixes: self.upstream.fail['uid-intl-'+suffix]=(403,{'code':11140,'msg':'request illegal'})
+        for suffix in suffixes: self.upstream.fail['uid-intl-'+suffix]=(403,{'code':11140,'msg':'request illegal','displayMsg':{'en':'Your account has been restricted due to unusual activity'}})
 
-    async def test_request_illegal_cools_down_instead_of_waiting_for_a_human(self):
-        # 11140 is risk control on one request: the account must come back on its own, not sit
-        # behind a permanent manual pause that only a Resume click can clear.
+    async def test_a_restricted_account_rests_and_the_next_one_serves(self):
+        # 11140 is the vendor's verdict on the account, so it rests for half an hour instead of a
+        # minute — but the region keeps serving from the other accounts meanwhile.
         self.illegal('a')
         status,payload,_=await self.send()
         self.assertEqual(status,200,payload)
-        entry=self.entry('request_illegal')
+        entry=self.entry('account_restricted')
         self.assertEqual(entry['scope'],'account',entry)
         self.assertFalse(entry['manual'],entry)
-        self.assertGreater(entry['retry_at'],stamp())
+        self.assertGreaterEqual(entry['retry_at']-stamp(),29*60*1000)
+        self.assertLessEqual(entry['retry_at']-stamp(),30*60*1000)
         self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
         entry['retry_at']=stamp()-1
         self.assertIsNone(self.gateway.risk.block('intl','intl_test_a',PATH))
@@ -208,13 +209,13 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status,429,payload)
         self.assertEqual(len(self.upstream.calls),10)
 
-    async def test_one_success_ends_the_account_failure_streak(self):
+    async def test_one_success_ends_the_account_restriction_streak(self):
         self.illegal('a')
         status,_,_=await self.send()
         self.assertEqual(status,200)
-        first=self.entry('request_illegal')
+        first=self.entry('account_restricted')
         self.assertEqual(first['count'],1)
-        # The cooldown expires and the account serves again: that ends its streak.
+        # The rest expires and the account serves again: that ends its streak.
         first['retry_at']=stamp()-1; self.gateway.risk.save(); self.upstream.fail.pop('uid-intl-a')
         status,payload,_=await self.send()
         self.assertEqual(status,200,payload)
@@ -222,28 +223,128 @@ class AccountScope(unittest.IsolatedAsyncioTestCase):
         self.illegal('a')
         status,_,_=await self.send()
         self.assertEqual(status,200)
-        again=[e for e in self.gateway.store.risks if e['kind']=='request_illegal'][-1]
+        again=[e for e in self.gateway.store.risks if e['kind']=='account_restricted'][-1]
         self.assertEqual(again['count'],1,again)
-        self.assertLessEqual(again['retry_at']-stamp(),60000)
+        self.assertFalse(again['manual'],again)
 
-    async def test_consecutive_rejections_double_the_cooldown(self):
-        # No success in between, so the second rejection is the second one in the streak.
+    async def test_a_repeat_restriction_parks_the_account_until_an_appeal(self):
+        # No success in between, so the second verdict is the second one in the streak: the account
+        # stays out until the operator appeals, because waiting a minute does not lift 11140.
         self.illegal('a')
         await self.send()
-        first=self.entry('request_illegal')
+        first=self.entry('account_restricted')
         first['retry_at']=stamp()-1; self.gateway.risk.save()
         await self.send()
-        again=[e for e in self.gateway.store.risks if e['kind']=='request_illegal'][-1]
+        again=[e for e in self.gateway.store.risks if e['kind']=='account_restricted'][-1]
         self.assertEqual(again['count'],2,again)
-        self.assertGreater(again['retry_at']-stamp(),60000)
+        self.assertTrue(again['manual'],again)
+        self.assertIn('Submit feedback',again['action'],again)
+        self.assertGreaterEqual(again['retry_at']-stamp(),119*60*1000)
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+        # A manual row is not cleared by a 200: only the operator ends it.
+        self.gateway.risk.served('intl','intl_test_a')
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
 
     async def test_a_rejected_account_does_not_take_the_region_with_it(self):
-        # 11140 is per request, not per region: with one account flagged the other keeps serving.
+        # 11140 lands per account, not per region: with one account flagged the other keeps serving.
         self.illegal('a')
         status,payload,_=await self.send()
         self.assertEqual(status,200,payload)
-        self.assertEqual(self.entry('request_illegal')['scope'],'account')
+        self.assertEqual(self.entry('account_restricted')['scope'],'account')
         self.assertIsNone(self.gateway.risk.block('intl','intl_test_b',PATH))
+
+
+    async def test_a_restricted_account_is_skipped_by_later_requests(self):
+        # The rest is what makes the walk cheap: once every account is restricted, a request is refused
+        # locally instead of walking the pool again.
+        self.pool(6); self.illegal('a','b')
+        for i in range(6):
+            self.upstream.fail['uid-cap-%02d'%i]=(403,{'code':11140,'msg':'request illegal'})
+        status,payload,_=await self.send()
+        self.assertEqual(status,403,payload)
+        walked=len(self.upstream.calls)
+        self.assertEqual(walked,8,self.upstream.calls)
+        status,payload,_=await self.send()
+        self.assertEqual(status,403,payload)
+        self.assertEqual(len(self.upstream.calls),walked,self.upstream.calls)
+
+    async def test_one_restriction_still_fails_over_to_a_healthy_account(self):
+        # A 11140 is per account, so a restricted account never fails a request a healthy one can serve.
+        self.pool(3); self.upstream.fail['uid-cap-00']=(403,{'code':11140,'msg':'request illegal'})
+        status,payload,_=await self.send()
+        self.assertEqual(status,200,payload)
+        self.assertEqual(len(self.upstream.calls),2,self.upstream.calls)
+
+
+class AccountSwitch(unittest.IsolatedAsyncioTestCase):
+    """A disabled account stays saved but leaves the pool."""
+    async def asyncSetUp(self):
+        self.upstream=Upstream(); port=await self.upstream.start()
+        config={'intl':{'region':'intl','endpoint':'http://127.0.0.1:%d'%port,'platform':'workbuddy-ai','version':'5.6.2','applicationName':'workbuddy-ai'}}
+        self.tmp=tempfile.TemporaryDirectory()
+        self.gateway=Gateway(ROOT,data_dir=self.tmp.name,config=config,test_origins=True)
+        self.gateway.store.put({'id':'intl_test_a','region':'intl','account':{'uid':'uid-intl-a','nickname':'intla'},'auth':{'accessToken':'token-a','expiresAt':stamp()+3600000}})
+        self.key=self.gateway.store.new_key({'name':'tests','scope':'intl'})['key']
+        self.runner=web.AppRunner(create_app(self.gateway)); await self.runner.setup()
+        self.site=web.TCPSite(self.runner,'127.0.0.1',0); await self.site.start()
+        self.base='http://127.0.0.1:%d'%self.site._server.sockets[0].getsockname()[1]
+        self.session=ClientSession()
+    async def asyncTearDown(self):
+        await self.session.close(); await self.runner.cleanup(); await self.upstream.stop(); self.tmp.cleanup()
+    async def admin(self,path,method='POST',body=None):
+        async with self.session.request(method,self.base+path,headers={'Authorization':'Bearer '+self.gateway.admin_key},json={} if body is None else body) as response:
+            return response.status,await response.json()
+    async def chat(self):
+        body={'model':'gl/'+MODEL,'messages':[{'role':'user','content':'hello'}],'max_tokens':16}
+        async with self.session.post(self.base+'/v1/chat/completions',json=body,headers={'Authorization':'Bearer '+self.key}) as response:
+            return response.status,await response.json()
+
+    async def test_a_disabled_account_leaves_the_pool_and_keeps_its_record(self):
+        status,payload=await self.admin('/admin/accounts/intl_test_a/disable')
+        self.assertEqual(status,200,payload)
+        self.assertFalse(payload['enabled'],payload)
+        self.assertIn('intl_test_a',self.gateway.store.records)
+        status,payload=await self.chat()
+        self.assertEqual(status,503,payload)
+        self.assertEqual(self.upstream.calls,[],self.upstream.calls)
+
+    async def test_enable_puts_it_back_in_the_pool(self):
+        await self.admin('/admin/accounts/intl_test_a/disable')
+        status,payload=await self.admin('/admin/accounts/intl_test_a/enable')
+        self.assertEqual(status,200,payload)
+        self.assertTrue(payload['enabled'],payload)
+        status,payload=await self.chat()
+        self.assertEqual(status,200,payload)
+        self.assertEqual(len(self.upstream.calls),1)
+
+    async def test_a_disabled_account_is_not_swept_by_a_bulk_job(self):
+        await self.admin('/admin/accounts/intl_test_a/disable')
+        self.assertEqual(self.gateway.accounts(region=None),[])
+
+    async def test_a_disabled_account_refuses_balance_and_refresh(self):
+        # Nothing is sent upstream for an account out of the pool: no balance probe, no check-in,
+        # no token refresh, so a parked account cannot be re-flagged while it rests.
+        await self.admin('/admin/accounts/intl_test_a/disable')
+        for action in ('balance','checkin','inspect','refresh'):
+            status,payload=await self.admin('/admin/accounts/intl_test_a/'+action)
+            self.assertEqual(status,409,payload)
+            self.assertEqual(payload['error']['code'],'account_disabled',payload)
+        self.assertEqual(self.upstream.calls,[],self.upstream.calls)
+
+    async def test_bulk_disable_and_enable_by_selection(self):
+        self.gateway.store.put({'id':'intl_test_b','region':'intl','account':{'uid':'uid-intl-b','nickname':'intlb'},'auth':{'accessToken':'token-b','expiresAt':stamp()+3600000}})
+        status,payload=await self.admin('/admin/jobs',body={'action':'disable','account_ids':['intl_test_a','intl_test_b']})
+        self.assertEqual(status,202,payload)
+        self.assertEqual((payload['disabled'],payload['enabled'],payload['skipped']),(2,0,0),payload)
+        self.assertEqual(self.gateway.accounts(region=None),[])
+        status,payload=await self.admin('/admin/jobs',body={'action':'enable','account_ids':['intl_test_a']})
+        self.assertEqual(status,202,payload)
+        self.assertEqual([r['id'] for r in self.gateway.accounts(region=None)],['intl_test_a'])
+        # A refresh job never reaches the disabled account, so nothing is probed upstream for it.
+        before=len(self.upstream.calls)
+        status,job=await self.admin('/admin/jobs',body={'action':'refresh','account_ids':['intl_test_b']})
+        self.assertEqual(job['total'],0,job)
+        self.assertEqual(len(self.upstream.calls),before)
 
 
 class ScopeMigration(unittest.TestCase):
@@ -265,10 +366,20 @@ class ScopeMigration(unittest.TestCase):
         self.assertEqual(gateway.store.risks[0]['scope'],'region')
         self.assertIsNotNone(gateway.risk.block('intl','intl_y',PATH))
 
-    def test_a_permanently_paused_11140_row_is_reclassified_and_cleared(self):
+    def test_a_permanently_paused_11140_row_is_reclassified_and_rested(self):
         entry=self.entry('intl_x'); entry.update(kind='permission_denied',manual=True,upstream_code='11140')
         gateway=self.gateway(entry)
         stored=gateway.store.risks[0]
-        self.assertEqual(stored['kind'],'request_illegal')
+        self.assertEqual(stored['kind'],'account_restricted')
         self.assertFalse(stored['manual'])
-        self.assertIsNone(gateway.risk.block('intl','intl_x',PATH))
+        self.assertIsNotNone(gateway.risk.block('intl','intl_x',PATH))
+
+    def test_an_old_request_illegal_row_is_carried_over_to_the_longer_rest(self):
+        # The previous build rested the account for a minute and called the verdict transient. On load
+        # the row becomes an account restriction with the appeal named as the way back.
+        entry=self.entry('intl_x'); entry.update(kind='request_illegal',manual=False,upstream_code='11140')
+        gateway=self.gateway(entry)
+        stored=gateway.store.risks[0]
+        self.assertEqual(stored['kind'],'account_restricted')
+        self.assertIn('Submit feedback',stored['action'])
+        self.assertIsNotNone(gateway.risk.block('intl','intl_x',PATH))
