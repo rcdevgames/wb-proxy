@@ -201,7 +201,7 @@ class Risk:
             delay=min(delay*2**min(count-1,10),60000 if kind=='upstream_unavailable' else 900000)
         try: delay=max(delay,float((headers or {}).get('Retry-After',0))*1000)
         except ValueError: pass
-        e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+(0 if diagnostic else delay),'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code or None,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now(),**({'diagnostic_only':True} if diagnostic else {}),**({'upstream_body':'non-json'} if unparsed else {})}
+        e={'id':(old or {}).get('id',uid()),'kind':kind,'scope':scope,'manual':manual,'region':region,'account_id':account,'path':path,'status':st,'retry_at':stamp()+(0 if diagnostic else delay),'count':count,'action':'Resolve the account restriction through official channels, then resume manually.' if manual else 'Upstream is temporarily rate limiting requests; no account switching or replay during cooldown.','upstream_code':code or None,'request_id':(headers or {}).get('X-Request-ID'),'updated_at':now(),'dismissed_at':None,**({'diagnostic_only':True} if diagnostic else {}),**({'upstream_body':'non-json'} if unparsed else {})}
         if kind=='channel_not_allowed':e['action']='Upstream rejected this request (11128: unapproved channel). The cause is not yet identified; no automatic replay, no account switching, and no region-wide block on this basis.'
         if kind=='rate_limited':e['action']='Upstream is rate limiting this account; the region keeps serving from the other accounts during the cooldown.'
         if kind=='account_restricted':e['action']=RESTRICTED_APPEAL if manual else RESTRICTED_ACTION
@@ -224,3 +224,14 @@ class Risk:
             return Fault(st,message,'risk_'+kind,e)
         return Fault(st,e['action'],'risk_'+kind,e)
     def list(self): return [e for e in self.store.risks if self.active(e)]
+    def visible(self):
+        # The page-level panel lists what still wants attention; a dismissed row keeps blocking traffic
+        # and keeps showing on its account, it just stops interrupting the whole page.
+        return [e for e in self.store.risks if self.active(e) and not e.get('dismissed_at')]
+    def dismiss(self,restriction_id,official_issue_resolved=False):
+        e=next((x for x in self.store.risks if x['id']==restriction_id),None)
+        require(e,'Restriction not found',404,'restriction_not_found')
+        # A manual row asks for a real-world confirmation before it can be hidden, so the prompt cannot
+        # be clicked past while the vendor-side problem is unresolved.
+        if e.get('manual'): require(official_issue_resolved is True,'Confirm the official issue first',400,'official_issue_resolved_required')
+        e['dismissed_at']=now(); self.save(); return e

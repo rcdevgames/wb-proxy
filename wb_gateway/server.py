@@ -260,7 +260,7 @@ class Gateway:
                 if r['region']==region: unique[(r['account'].get('uid'),r['account'].get('enterpriseId'))]=r
             balances=[r.get('management',{}).get('balance',{}) for r in unique.values()]; known=[b for b in balances if number(b.get('remaining')) and not b.get('error') and not b.get('stale')]
             regions[region]={'accounts':len(unique),'known_subtotal':sum(b['remaining'] for b in known),'known':len(known),'unknown':sum(not b or bool(b.get('error')) for b in balances),'unlimited':sum(bool(b.get('unlimited')) for b in balances),'unit':'credits','stale':sum(bool(b.get('stale')) and number(b.get('remaining')) for b in balances),'cached_subtotal':sum(b['remaining'] for b in balances if number(b.get('remaining'))),'cached':True}
-        return {'accounts':rows,'regions':regions,'restrictions':self.risk.list(),'network':{'source':self.proxy_source,'mode':os.environ.get('WB_PROXY_MODE','auto')},'updated_at':now()}
+        return {'accounts':rows,'regions':regions,'restrictions':self.risk.visible(),'restriction_count':len(self.risk.list()),'network':{'source':self.proxy_source,'mode':os.environ.get('WB_PROXY_MODE','auto')},'updated_at':now()}
     async def import_accounts(self,text,limit=50):
         require(isinstance(text,str) and bool(text.strip()),'Import text required')
         require(len(text)<=2*1024*1024,'Import text too large',413,'import_too_large')
@@ -560,9 +560,14 @@ class Gateway:
             if path=='/admin/accounts/import' and method=='POST': return jresponse(await self.import_accounts((await json_body(req)).get('text','')),201)
             if path=='/admin/model-pricing' and method=='GET': return jresponse(await self.pricing(req.query.get('region','cn'),req.query.get('account_id')))
             if path=='/admin/call-logs' and method=='GET': return jresponse(self.log_query(req.query))
-            if path=='/admin/risk' and method=='GET': return jresponse({'restrictions':self.risk.list()})
-            if len(parts)==4 and parts[1]=='risk' and parts[3]=='resume' and method=='POST':
-                b=await json_body(req); require(b.get('official_issue_resolved') is True,'Official issue resolution must be confirmed'); e=next((x for x in self.store.risks if x['id']==parts[2]),None); require(e,'Restriction not found',404); e['resolved_at']=now(); self.risk.save(); return jresponse({'resumed':True,'replayed':False})
+            if path=='/admin/risk' and method=='GET': return jresponse({'restrictions':self.risk.visible(),'count':len(self.risk.list())})
+            if len(parts)==4 and parts[1]=='risk' and parts[3] in ('resume','dismiss') and method=='POST':
+                b=await json_body(req); e=next((x for x in self.store.risks if x['id']==parts[2]),None); require(e,'Restriction not found',404,'restriction_not_found')
+                if parts[3]=='resume':
+                    require(b.get('official_issue_resolved') is True,'Official issue resolution must be confirmed'); e['resolved_at']=now(); self.risk.save(); return jresponse({'resumed':True,'replayed':False})
+                # Dismiss only hides the row: the pause keeps its cooldown and the account stays out of
+                # the pool, so hiding a restriction can never be mistaken for clearing it.
+                e=self.risk.dismiss(parts[2],b.get('official_issue_resolved') is True); return jresponse({'dismissed':True,'dismissed_at':e['dismissed_at'],'restriction':e})
             if path=='/admin/keys':
                 if method=='GET': return jresponse({'keys':self.store.public_keys(),'active':self.limits.snapshot(),'legacy_api_key_enabled':False,'base_path':'/v1'})
                 if method=='POST': return jresponse(self.store.new_key(await json_body(req)),201)

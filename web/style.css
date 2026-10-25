@@ -39,3 +39,5 @@
 .key-copy:disabled{opacity:.4}
 .rotate-action{margin-right:auto}
 @media(max-width:700px){.key-copy{min-height:24px;padding:2px 8px}}
+
+.badge-button{border:0;min-height:0;line-height:1.2;cursor:pointer}.badge-button:hover,.badge-button:focus-visible{box-shadow:0 0 0 2px var(--accent-soft);outline:1px solid var(--accent)}.risk-title{display:block;border:0;background:transparent;color:var(--text);font:inherit;font-weight:600;padding:0;text-align:left;cursor:pointer}.risk-title:hover,.risk-title:focus-visible{color:var(--accent);text-decoration:underline}.callout{padding:10px 12px;border-radius:6px;background:var(--subtle);line-height:1.55}

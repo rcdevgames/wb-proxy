@@ -346,6 +346,45 @@ class AccountSwitch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job['total'],0,job)
         self.assertEqual(len(self.upstream.calls),before)
 
+    async def test_a_dismissed_restriction_keeps_its_cooldown_and_stays_blocking(self):
+        # Dismissing hides the row from the console; it does not unblock the account, so traffic keeps
+        # being refused until the cooldown ends on its own.
+        self.upstream.fail['uid-intl-a']=(429,{'code':14003,'msg':'Too many requests, please retry later.'})
+        status,payload=await self.chat()
+        self.assertEqual(status,429,payload)
+        entry=self.gateway.store.risks[-1]
+        self.assertEqual(entry['kind'],'rate_limited',entry)
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+        self.assertIn(entry['id'],[e['id'] for e in self.gateway.risk.visible()])
+        status,payload=await self.admin('/admin/risk/'+entry['id']+'/dismiss')
+        self.assertEqual(status,200,payload)
+        self.assertIsNotNone(payload['dismissed_at'],payload)
+        self.assertNotIn(entry['id'],[e['id'] for e in self.gateway.risk.visible()])
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+        # The pause itself is untouched, so hiding it never turns into a silent resume.
+        self.assertFalse(any(e.get('resolved_at') for e in self.gateway.store.risks),self.gateway.store.risks)
+
+    async def test_dismissing_a_manual_restriction_needs_the_official_confirmation(self):
+        self.upstream.fail['uid-intl-a']=(403,{'code':'E0010458','msg':'Enterprise creation quota exceeded'})
+        status,payload=await self.chat()
+        self.assertEqual(status,403,payload)
+        entry=self.gateway.store.risks[-1]
+        self.assertTrue(entry['manual'],entry)
+        status,payload=await self.admin('/admin/risk/'+entry['id']+'/dismiss')
+        self.assertEqual(status,400,payload)
+        self.assertEqual(payload['error']['code'],'official_issue_resolved_required',payload)
+        status,payload=await self.admin('/admin/risk/'+entry['id']+'/dismiss',body={'official_issue_resolved':True})
+        self.assertEqual(status,200,payload)
+        self.assertIsNotNone(payload['dismissed_at'],payload)
+        self.assertNotIn(entry['id'],[e['id'] for e in self.gateway.risk.visible()])
+        # A manual row still blocks traffic until it is resumed, not merely hidden.
+        self.assertIsNotNone(self.gateway.risk.block('intl','intl_test_a',PATH))
+
+    async def test_dismissing_an_unknown_restriction_is_a_404(self):
+        status,payload=await self.admin('/admin/risk/nope/dismiss')
+        self.assertEqual(status,404,payload)
+        self.assertEqual(payload['error']['code'],'restriction_not_found',payload)
+
 
 class ScopeMigration(unittest.TestCase):
     """A rate limit written with the old region scope is corrected at startup."""
